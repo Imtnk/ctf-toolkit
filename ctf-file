@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+# ctf-file — automated first-pass forensics triage for a single file.  (see: ctf-file -h)
+set -uo pipefail
+
+usage(){ cat <<'MAN'
+NAME
+    ctf-file — automated first-pass forensics triage for a single file.
+
+SYNOPSIS
+    ctf-file <file> [-d easy|medium|hard] [-c] [-n] [-v] [-w wordlist] [-h]
+
+DESCRIPTION
+    Runs the standard forensics recon reflex on ONE file and prints a colour-coded,
+    section-by-section report, then a SUMMARY of everything that looks like a flag.
+    It is read-only on your file; anything it extracts is written to ./<file>-work/.
+    Missing tools are skipped (never fatal). Colour, the progress bar and the spinner
+    appear only on an interactive terminal — piping the output (e.g. into ctf-eval /
+    ai.py / a file) yields clean plain text.
+
+FLAG FORMAT
+    The prefix(es) hunted for (the part before "{") come from, in priority order:
+      1. $CTF_FLAG_FORMAT env var   (e.g. CTF_FLAG_FORMAT=ctf ctf-file chall)
+      2. ~/.config/ctf-file/format  (one prefix per line; # comments allowed)
+      3. built-in default: flag ctf key
+    "Just the beginning" is enough — put `ctf` to hunt ctf{...}. The rot13 form of
+    each prefix is derived automatically, so rot13-encoded flags are still detected.
+
+OPTIONS
+    -d <level>   Force the password-cracking effort and skip the interactive prompts:
+                   easy    common built-in password list only (instant)
+                   medium  common list, then rockyou.txt
+                   hard    common list, then rockyou.txt + john mangling rules
+                 If -d is omitted and you are at a terminal, ctf-file tries the common
+                 list first and then PROMPTS before escalating to medium, then hard.
+    -c           Non-interactive escalation: run the wordlist tier automatically
+                 (pairs with -d; implied "yes" to escalation when not at a terminal).
+    -n           Do not auto-extract embedded files (skip binwalk -e and zip extraction).
+    -v, --verbose  Echo every underlying tool command as it runs. The full command list
+                 is ALSO always saved to ./<file>-work/commands.log (with or without -v).
+    -w <path>    Use this wordlist instead of rockyou.txt for medium/hard.
+    -h, --help   Show this manual.
+
+SECTIONS (in order)
+    IDENTIFY · STRINGS · METADATA · CARVING · STEGANOGRAPHY · PASSWORD GUESSING ·
+    AUTO-DECODE · SUMMARY · DONE
+
+PASSWORD GUESSING
+    The cheap built-in common-password list is ALWAYS tried first, at every tier, for
+    both encrypted archives (zip/rar/pdf/office) and steghide-capable media. Only if it
+    misses does ctf-file escalate to rockyou — automatically with -d/-c, or by prompting
+    you (y/N) when run interactively. A cracked archive is auto-extracted and its flag
+    shown, not just the password.
+
+OUTPUT / EXIT STATUS
+    Report on stdout; progress bar + spinner on stderr (interactive only).
+    Exit 0 on success; 1 on usage error / missing file.
+
+EXAMPLES
+    ctf-file suspicious.bin              # full triage; prompts before heavy cracking
+    ctf-file locked.zip                  # common list cracks it instantly if it's weak
+    ctf-file photo.jpg -d hard           # non-interactive, escalate straight to rockyou+rules
+    ctf-file dump.raw -n                 # skip extraction (big image)
+    ctf-file chall.png | ctf-eval        # plain-text report piped onward (no colour/prompts)
+
+SEE ALSO
+    ctf-eval, ai.py, and the vault note CTF-Forensics/scripts/README.ai.md
+MAN
+}
+
+# ---- args ----------------------------------------------------------------
+DIFF="medium"; EXPLICIT_DIFF=0; DO_CRACK=0; NO_EXTRACT=0; WORDLIST_OVERRIDE=""; VERBOSE=0; F=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d) shift; DIFF="${1:-medium}"; EXPLICIT_DIFF=1 ;;
+    -c) DO_CRACK=1 ;;
+    -n) NO_EXTRACT=1 ;;
+    -v|--verbose) VERBOSE=1 ;;
+    -w) shift; WORDLIST_OVERRIDE="${1:-}" ;;
+    -h|--help) usage; exit 0 ;;
+    *)  F="$1" ;;
+  esac
+  shift
+done
+[ -z "$F" ] && { echo "usage: ctf-file <file> [-d easy|medium|hard] [-c] [-n] [-v] [-w wordlist] [-h]"; exit 1; }
+[ -f "$F" ] || { echo "not a file: $F"; exit 1; }
+case "$F" in -*) F="./$F";; esac         # H2: never let a filename be parsed as a tool option
+case "$DIFF" in easy|medium|hard) ;; *) echo "unknown difficulty '$DIFF' — using medium"; DIFF=medium ;; esac
+
+BASE="$(basename "$F")"
+OUT="${BASE}-work"
+rm -rf -- "$OUT" 2>/dev/null             # M2: fresh work dir each run (no stale cross-file flags)
+
+# ---- flag format ---------------------------------------------------------
+# Prefixes to hunt for (the part before "{"). Source, in priority order:
+#   $CTF_FLAG_FORMAT env  ->  ~/.config/ctf-file/format file  ->  built-in default.
+# "Just the beginning" — e.g. put `ctf` to search ctf{...}. rot13 forms are derived
+# automatically (so a rot13-encoded flag is still detected in AUTO-DECODE).
+rot13(){ printf '%s' "$1" | tr 'A-Za-z' 'N-ZA-Mn-za-m'; }
+FMT_FILE="${CTF_FLAG_FORMAT_FILE:-$HOME/.config/ctf-file/format}"
+PREFIXES=()
+if [ -n "${CTF_FLAG_FORMAT:-}" ]; then
+  for w in $(printf '%s' "$CTF_FLAG_FORMAT" | tr ',{}' '   '); do PREFIXES+=("$w"); done
+elif [ -f "$FMT_FILE" ]; then
+  # `|| [ -n "$line" ]` so a final line without a trailing newline is still processed
+  while IFS= read -r line || [ -n "$line" ]; do line="${line%%#*}"
+    for w in $line; do w="${w%%\{*}"; [ -n "$w" ] && PREFIXES+=("$w"); done
+  done < "$FMT_FILE"
+fi
+[ ${#PREFIXES[@]} -gt 0 ] || PREFIXES=(flag ctf key)
+FLAGRE=""; FLAGTOK_ALT=""; ENCRE=""
+for p in "${PREFIXES[@]}"; do
+  r="$(rot13 "$p")"
+  FLAGRE+="${FLAGRE:+|}${p}\\{|${r}\\{"
+  FLAGTOK_ALT+="${FLAGTOK_ALT:+|}${p}|${r}"
+  ENCRE+="${ENCRE:+|}${r}\\{"
+done
+FLAGTOK="(${FLAGTOK_ALT})\\{[^}]*\\}"
+
+# ---- presentation --------------------------------------------------------
+have(){ command -v "$1" >/dev/null 2>&1; }
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_H=$'\033[1;36m'; C_G=$'\033[1;32m'; C_Y=$'\033[1;33m'; C_R=$'\033[1;31m'
+  C_M=$'\033[1;35m'; C_D=$'\033[2m'; C_B=$'\033[1m'; C_0=$'\033[0m'
+else C_H=''; C_G=''; C_Y=''; C_R=''; C_M=''; C_D=''; C_B=''; C_0=''; fi
+
+# progress bar + spinner: stderr, interactive-only
+PROG=0; STEP=0; TOTAL=9; [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && PROG=1
+# prompts: only when BOTH stdout and stdin are terminals (so ctf-eval's pipe never prompts)
+INTERACTIVE=0; [ -t 1 ] && [ -t 0 ] && INTERACTIVE=1
+
+bar(){ [ "$PROG" = 1 ] || return 0; STEP=$((STEP+1)); local w=24 n f e
+  n=$((STEP*w/TOTAL)); f=$(printf '%*s' "$n" '' | tr ' ' '#'); e=$(printf '%*s' "$((w-n))" '' | tr ' ' '.')
+  printf '%s[%d/%d]%s [%s%s] %s\n' "$C_M" "$STEP" "$TOTAL" "$C_0" "$f" "$e" "$1" >&2; }
+spin(){ local label="$1"; shift; [ "$PROG" = 1 ] || { "$@"; return $?; }
+  "$@" & local pid=$! i=0; local s='|/-\'
+  while kill -0 "$pid" 2>/dev/null; do printf '\r\033[K%s  [%s]%s %s...' "$C_Y" "${s:i++%4:1}" "$C_0" "$label" >&2; sleep 0.1; done
+  printf '\r\033[K' >&2; wait "$pid"; }
+
+sec(){  bar "$1"; printf '\n%s=== %s ===%s\n' "$C_H" "$1" "$C_0"; }
+hit(){  printf '%s  >> %s%s\n' "$C_G" "$1" "$C_0"; }        # green — a positive result
+skip(){ printf '%s  (skipped — %s not installed)%s\n' "$C_Y" "$1" "$C_0"; }
+warn(){ printf '%s  %s%s\n' "$C_Y" "$1" "$C_0"; }
+dim(){  printf '%s  %s%s\n' "$C_D" "$1" "$C_0"; }           # dim — nothing found / neutral
+note(){ printf '  %s\n' "$1"; }
+mkout(){ mkdir -p "$OUT"; }
+# H1: grep only REGULAR files (no symlink following) so a malicious extracted symlink
+# can't make us read a flag out of, say, /etc/passwd.
+flagtok_in(){ find "$1" -type f -print0 2>/dev/null | xargs -0 -r grep -aoiE "$FLAGTOK" 2>/dev/null | sed 's/^[^:]*://' | sort -u | head -1; }
+# M3: first installed name from a candidate list (Kali ships pdf2john.pl / office2john.py)
+resolve_helper(){ local c; for c in "$@"; do have "$c" && { echo "$c"; return; }; done; echo ""; }
+
+FINDINGS=()
+POT=""                                       # per-run john pot (set in crack_archive)
+record(){ FINDINGS+=("$1"); }
+CMDS=""                                       # command log (-v shows it live; always saved)
+logcmd(){ CMDS+="$1"$'\n'; [ "$VERBOSE" = 1 ] && printf '%s  $ %s%s\n' "$C_D" "$1" "$C_0"; }
+gotflag(){ hit "$1"; record "$2"; }                        # green + add to SUMMARY
+
+ask_yes(){ [ "$INTERACTIVE" = 1 ] || return 1; local ans=''
+  printf '%s  %s [y/N] %s' "$C_Y" "$1" "$C_0" >/dev/tty 2>/dev/null || return 1
+  IFS= read -r ans </dev/tty 2>/dev/null || return 1
+  case "$ans" in [yY]|[yY][eE][sS]) return 0;; *) return 1;; esac; }
+
+resolve_rockyou(){ # robust: system copy -> user copy -> decompress .gz into ~/wordlists (writable)
+  local sys=/usr/share/wordlists/rockyou.txt user="$HOME/wordlists/rockyou.txt"
+  [ -f "$sys" ]  && { echo "$sys";  return; }
+  [ -f "$user" ] && { echo "$user"; return; }
+  if [ -f "$sys.gz" ]; then mkdir -p "$HOME/wordlists"
+    local tmp="$user.$$.part"                 # L7: temp-then-mv so an interrupted gunzip
+    if gunzip -kc "$sys.gz" > "$tmp" 2>/dev/null; then mv -f "$tmp" "$user"; echo "$user"; return
+    else rm -f "$tmp"; fi                      #     never leaves a truncated wordlist behind
+  fi
+  echo ""; }
+
+TYPE="$(file -b "$F" 2>/dev/null)"
+COMMON=("" password 123456 12345678 admin secret flag letmein qwerty root toor \
+        ctf password123 iloveyou dragon monkey abc123 111111 sunshine princess \
+        "$BASE" "${BASE%.*}")
+
+# ---- 1. identify ---------------------------------------------------------
+sec "IDENTIFY"
+logcmd "file -b \"$F\""; logcmd "xxd \"$F\" | head -4"
+note "path : $F"
+note "size : $(stat -c%s "$F" 2>/dev/null) bytes"
+printf '  type : %s%s%s\n' "$C_B" "$TYPE" "$C_0"
+echo "  magic:"; xxd "$F" | head -4 | sed 's/^/    /'
+
+# ---- 2. strings ----------------------------------------------------------
+sec "STRINGS (flag-like)"
+logcmd "strings -n 5 \"$F\" | grep -Ei '$FLAGRE'"
+logcmd "strings -e l \"$F\" | grep -Ei '$FLAGRE'"
+S_ASCII="$(strings -n 5 "$F" | grep -aEi "$FLAGRE" | sort -u)"
+S_WIDE="$(strings -e l "$F" 2>/dev/null | grep -aEi "$FLAGRE" | sort -u)"
+if [ -n "$S_ASCII$S_WIDE" ]; then
+  while read -r l; do [ -n "$l" ] && gotflag "$l" "STRINGS: $l"; done < <(printf '%s\n' "$S_ASCII")
+  while read -r l; do [ -n "$l" ] && gotflag "utf16: $l" "STRINGS(utf16): $l"; done < <(printf '%s\n' "$S_WIDE")
+else
+  dim "no obvious flag strings (try: strings -n 6 \"$F\" | less)"
+fi
+
+# ---- 3. metadata ---------------------------------------------------------
+sec "METADATA"
+if have exiftool; then
+  logcmd "exiftool \"$F\""
+  meta="$(exiftool "$F" 2>/dev/null | grep -viE '^(File (Name|Permissions|Inode|Modification|Access|Directory)|Directory)')"
+  [ -n "$meta" ] && printf '%s\n' "$meta" | sed 's/^/  /' || dim "no non-filesystem metadata"
+  while read -r ml; do [ -n "$ml" ] && gotflag "metadata: $ml" "METADATA: $ml"; done \
+    < <(printf '%s\n' "$meta" | grep -aEi "$FLAGRE")
+else skip exiftool; fi
+
+# ---- 4. carving (extracts by default) -----------------------------------
+sec "CARVING / EMBEDDED FILES"
+if have binwalk; then
+  logcmd "binwalk \"$F\""
+  binwalk "$F" | sed 's/^/  /'
+  if [ "$NO_EXTRACT" = 0 ]; then
+    mkout; note "extracting into $OUT/ ..."; logcmd "binwalk -e -C \"$OUT\" \"$F\""
+    # H1: binwalk -e drives external extractors on attacker-controlled magic (RCE / zip-slip
+    # class, cf. CVE-2022-4510). Do NOT fall back to --run-as=root on untrusted input.
+    OUT_ABS="$(cd "$OUT" 2>/dev/null && pwd)"
+    spin "carving embedded files" bash -c 'binwalk -e -C "$1" "$2" </dev/null >/dev/null 2>&1' _ "$OUT" "$F"
+    # guardrail: flag symlinks whose target escapes $OUT/ (they are ignored — flagtok_in reads
+    # regular files only, so nothing outside $OUT is ever trusted as a flag).
+    esc="$(find "$OUT" -type l 2>/dev/null | while read -r p; do t="$(readlink -f "$p" 2>/dev/null)"
+        case "$t" in "$OUT_ABS"/*|"$OUT_ABS"|'') ;; *) printf '%s -> %s\n' "$p" "$t";; esac; done)"
+    [ -n "$esc" ] && { warn "SECURITY: extraction created symlink(s) pointing OUTSIDE $OUT/ (ignored, possible zip-slip):"; printf '%s\n' "$esc" | sed 's/^/    /'; }
+    found="$(find "$OUT" -mindepth 1 -type f 2>/dev/null)"
+    if [ -n "$found" ]; then note "extracted:"; printf '%s\n' "$found" | sed 's/^/    /'
+      ctok="$(flagtok_in "$OUT")"
+      [ -n "$ctok" ] && gotflag "flag in carved data: $ctok" "CARVING: $ctok"
+    else dim "nothing carved"; fi
+  else warn "-n given — skipping auto-extraction"; fi
+else skip binwalk; fi
+# opportunistic: a zip in disguise (never block on a password prompt)
+if [ "$NO_EXTRACT" = 0 ] && have unzip && unzip -l "$F" >/dev/null 2>&1; then
+  mkout; logcmd "unzip -P '' \"$F\" -d \"$OUT/unzip\""
+  if unzip -o -q -P '' "$F" -d "$OUT/unzip" </dev/null 2>/dev/null; then
+    hit "file is a ZIP — extracted to $OUT/unzip/"; find "$OUT/unzip" -type f | sed 's/^/    /'
+    ztok="$(flagtok_in "$OUT/unzip")"
+    [ -n "$ztok" ] && gotflag "flag in zip: $ztok" "ZIP: $ztok"
+  else
+    warn "ZIP is encrypted / needs a password — see PASSWORD GUESSING below"
+  fi
+fi
+
+# ---- 5. steganography (images / audio only) ------------------------------
+sec "STEGANOGRAPHY"
+IS_STEGO_MEDIA=0
+case "$TYPE" in
+  *PNG*|*bitmap*|*JPEG*|*GIF*|*"WAVE audio"*|*"Audio file"*)
+    IS_STEGO_MEDIA=1
+    if [[ "$TYPE" == *PNG* ]] && have pngcheck; then echo "  -- pngcheck:"; logcmd "pngcheck -v \"$F\""; pngcheck -v "$F" | grep -viE 'zlib|compressed' | sed 's/^/  /'; fi
+    if [[ "$TYPE" == *PNG* || "$TYPE" == *bitmap* ]]; then
+      if have zsteg; then echo "  -- zsteg -a:"; logcmd "zsteg -a \"$F\""
+        zout="$(zsteg -a "$F" 2>/dev/null)"                      # L4: run the slow scan once
+        printf '%s\n' "$zout" | grep -aEi "$FLAGRE|text|ascii" | head -40 | sed 's/^/  /'
+        ztok="$(printf '%s\n' "$zout" | grep -aoiE "$FLAGTOK" | head -1)"; [ -n "$ztok" ] && gotflag "zsteg: $ztok" "ZSTEG: $ztok"
+      else skip zsteg; fi
+    fi
+    if [[ "$TYPE" == *JPEG* || "$TYPE" == *bitmap* || "$TYPE" == *WAVE* ]] && have steghide; then
+      echo "  -- steghide (empty passphrase):"; mkout; logcmd "steghide extract -sf \"$F\" -p '' -xf \"$OUT/steghide_empty.out\""
+      rm -f "$OUT/steghide_empty.out"                            # M5: avoid overwrite prompt
+      if steghide extract -sf "$F" -p '' -xf "$OUT/steghide_empty.out" 2>/dev/null; then
+        hit "steghide extracted with EMPTY passphrase -> $OUT/steghide_empty.out"
+        etok="$(grep -aoiE "$FLAGTOK" "$OUT/steghide_empty.out" 2>/dev/null | head -1)"; [ -n "$etok" ] && record "STEGHIDE(empty): $etok"
+      else dim "no payload with empty passphrase"; fi
+    fi
+    ;;
+  *) dim "not an image/audio file — steganography checks skipped" ;;
+esac
+
+# ---- 6. password guessing ------------------------------------------------
+sec "PASSWORD GUESSING (start: common list$([ "$EXPLICIT_DIFF" = 1 ] && echo ", forced -d $DIFF"))"
+
+# helper: run john over a wordlist against $1=hash; returns 0 if THIS run cracked it.
+# Uses a per-run pot ($POT, cleared in crack_archive) so a previous crack cached in the
+# global ~/.john/john.pot never makes a weaker tier falsely report success.
+john_try(){ # $1 hash  $2 list  $3 rules  $4 label
+  local h="$1" list="$2" ru="$3" label="$4"
+  [ -n "$list" ] && [ -f "$list" ] || { warn "no wordlist available for $label"; return 1; }
+  logcmd "john \"$h\" --wordlist=\"$list\" $ru"
+  spin "cracking archive — $label" bash -c 'john "$1" --wordlist="$2" $3 --pot="$4" >/dev/null 2>&1' _ "$h" "$list" "$ru" "$POT"
+  john "$h" --pot="$POT" --show 2>/dev/null | grep -qE ':'; }
+
+# escalation decision shared by archive + steghide paths.
+# echoes: "auto" (run tier now, no prompt), "ask" (prompt), or "" (stop / note only)
+escalation_mode(){
+  if [ "$EXPLICIT_DIFF" = 1 ] || [ "$DO_CRACK" = 1 ]; then echo auto
+  elif [ "$INTERACTIVE" = 1 ]; then echo ask
+  else echo ""; fi
+}
+
+# 6a. encrypted archive cracking (zip/rar/pdf/office)
+crack_archive(){ # $1 helper (zip2john/…)   $2 friendly type
+  local helper="$1" kind="$2"
+  [ -n "$helper" ] || { warn "no *2john helper found for $kind (install john / john-jumbo)"; return; }
+  have "$helper" && have john || { warn "$helper/john not installed"; return; }
+  mkout; local h="$OUT/hash.txt"; logcmd "$helper \"$F\" > \"$h\""; "$helper" "$F" > "$h" 2>/dev/null
+  [ -s "$h" ] || { warn "could not build a hash (file may not be encrypted)"; return; }
+  POT="$OUT/john.pot"; rm -f "$POT"          # per-run pot: success reflects THIS run, not history
+  printf '%s\n' "${COMMON[@]}" | sort -u > "$OUT/common.lst"
+
+  local cracked=0
+  john_try "$h" "$OUT/common.lst" "" "common list" && cracked=1
+  if [ "$cracked" = 0 ]; then
+    local rock; rock="${WORDLIST_OVERRIDE:-$(resolve_rockyou)}"
+    local mode; mode="$(escalation_mode)"
+    if [ "$mode" = auto ]; then
+      if [ "$DIFF" = hard ]; then john_try "$h" "$rock" "--rules=Jumbo" "hard (rockyou+rules)" && cracked=1
+      elif [ "$DIFF" != easy ]; then john_try "$h" "$rock" "" "medium (rockyou)" && cracked=1; fi
+    elif [ "$mode" = ask ] && [ -n "$rock" ]; then
+      if ask_yes "Common list failed. Try MEDIUM (rockyou, ~14M words)?"; then
+        john_try "$h" "$rock" "" "medium (rockyou)" && cracked=1
+        if [ "$cracked" = 0 ] && ask_yes "Still nothing. Try HARD (rockyou + mangling rules, slow)?"; then
+          john_try "$h" "$rock" "--rules=Jumbo" "hard (rockyou+rules)" && cracked=1
+        fi
+      fi
+    else
+      warn "hash saved to $h — re-run with -c (or -d medium/hard), or from a terminal to escalate"
+    fi
+  fi
+
+  if [ "$cracked" = 1 ]; then
+    local line pw; line="$(john "$h" --pot="$POT" --show 2>/dev/null | grep -E ':' | head -1)"
+    pw="$(printf '%s' "$line" | awk -F: '{print $2}')"
+    hit "password FOUND: '${pw}'  ($kind)"
+    # auto-extract the flag with the recovered password
+    if [ "$kind" = zip ] && have unzip; then
+      logcmd "unzip -P '$pw' \"$F\" -d \"$OUT/unzip\""
+      unzip -o -P "$pw" "$F" -d "$OUT/unzip" </dev/null >/dev/null 2>&1
+      local tok; tok="$(flagtok_in "$OUT/unzip")"
+      if [ -n "$tok" ]; then gotflag "flag: $tok" "ARCHIVE zip (pw=$pw): $tok"
+      else note "extracted to $OUT/unzip/ (no flag{} token seen — check the files)"; record "ARCHIVE zip: password '$pw'"; fi
+    else
+      record "ARCHIVE $kind: password '$pw' (extract manually)"
+      note "extract with the password above to read the contents"
+    fi
+  fi
+}
+
+# 6b. steghide passphrase (jpg/bmp/wav)
+crack_steghide(){
+  have steghide || { skip steghide; return; }
+  mkout; local found=0 p
+  logcmd "for p in <common list>: steghide extract -sf \"$F\" -p \"\$p\""
+  for p in "${COMMON[@]}"; do
+    rm -f "$OUT/steghide_extract.out"                          # M5: no overwrite prompt
+    if steghide extract -sf "$F" -p "$p" -xf "$OUT/steghide_extract.out" 2>/dev/null; then
+      hit "steghide passphrase FOUND: '${p:-<empty>}' -> $OUT/steghide_extract.out"; found=1
+      local tok; tok="$(grep -aoiE "$FLAGTOK" "$OUT/steghide_extract.out" 2>/dev/null | head -1)"
+      [ -n "$tok" ] && gotflag "flag: $tok" "STEGHIDE (pw=${p:-<empty>}): $tok" || record "STEGHIDE: passphrase '${p:-<empty>}'"
+      break
+    fi
+  done
+  if [ "$found" = 0 ]; then
+    local rock; rock="${WORDLIST_OVERRIDE:-$(resolve_rockyou)}"
+    local mode; mode="$(escalation_mode)"
+    if have stegseek && [ -n "$rock" ] && { [ "$mode" = auto ] || { [ "$mode" = ask ] && ask_yes "Common list failed. Try stegseek on rockyou?"; }; }; then
+      rm -f "$OUT/stegseek.out"                                 # M4: capture the payload,
+      logcmd "stegseek \"$F\" \"$rock\" -xf \"$OUT/stegseek.out\""  #     don't drop it in CWD
+      local o; o="$(spin "stegseek rockyou" stegseek "$F" "$rock" -xf "$OUT/stegseek.out" 2>&1; :)"
+      printf '%s\n' "$o" | grep -aiE 'found|passphrase|wrote' | sed 's/^/  /'
+      local tok; tok="$(grep -aoiE "$FLAGTOK" "$OUT/stegseek.out" 2>/dev/null | head -1)"
+      [ -z "$tok" ] && tok="$(printf '%s' "$o" | grep -aoiE "$FLAGTOK" | head -1)"
+      [ -n "$tok" ] && gotflag "flag: $tok" "STEGSEEK: $tok"
+    elif [ "$mode" = "" ]; then
+      warn "common passphrases failed — re-run with -c, or from a terminal to try rockyou"
+    else
+      dim "common passphrases failed"
+    fi
+  fi
+}
+
+case "$TYPE" in
+  *Zip*)                  echo "  -- zip:";    crack_archive "$(resolve_helper zip2john)"    zip ;;
+  *RAR*)                  echo "  -- rar:";    crack_archive "$(resolve_helper rar2john)"    rar ;;
+  *PDF*)                  echo "  -- pdf:";    crack_archive "$(resolve_helper pdf2john pdf2john.pl)" pdf ;;
+  *Microsoft*|*"Composite Document"*|*OpenXML*) echo "  -- office:"; crack_archive "$(resolve_helper office2john office2john.py)" office ;;
+  # L3: steghide only supports JPEG/BMP/WAV/AU — don't run its passphrase loop on PNG/GIF.
+  *JPEG*|*bitmap*|*"WAVE audio"*) echo "  -- steghide passphrase:"; crack_steghide ;;
+  *) if [ "$IS_STEGO_MEDIA" = 1 ]; then dim "PNG/GIF — steghide N/A; LSB already tried in STEGANOGRAPHY"
+     else dim "no encryptable archive or crackable stego media detected"; fi ;;
+esac
+
+# ---- 7. auto-decode flag-like strings ------------------------------------
+sec "AUTO-DECODE (rot13 / base64)"
+logcmd "strings -n 6 \"$F\" | grep -Ei '$ENCRE|[A-Za-z0-9+/]{16,}={0,2}\$'  (then rot13 + base64 -d)"
+CAND="$(strings -n 6 "$F" | grep -aEi "$ENCRE"'|[A-Za-z0-9+/]{16,}={0,2}$' | sort -u | head -20)"
+DEC_ANY=0
+if [ -n "$CAND" ]; then
+  while read -r s; do
+    [ -n "$s" ] || continue
+    r=$(printf '%s' "$s" | tr 'A-Za-z' 'N-ZA-Mn-za-m')
+    printf '%s\n' "$r" | grep -qiE "$FLAGRE" && { gotflag "rot13: $r" "AUTO-DECODE rot13: $r"; DEC_ANY=1; }
+    b=$(printf '%s' "$s" | base64 -d 2>/dev/null)
+    printf '%s\n' "$b" | grep -qiE "$FLAGRE" && { gotflag "base64: $b" "AUTO-DECODE base64: $b"; DEC_ANY=1; }
+  done < <(printf '%s\n' "$CAND")
+fi
+[ "$DEC_ANY" = 0 ] && dim "nothing decoded to a flag"
+
+# ---- 8. summary ----------------------------------------------------------
+sec "SUMMARY"
+if [ ${#FINDINGS[@]} -gt 0 ]; then
+  printf '%s  %d finding(s):%s\n' "$C_G" "${#FINDINGS[@]}" "$C_0"
+  for x in "${FINDINGS[@]}"; do printf '%s   * %s%s\n' "$C_G" "$x" "$C_0"; done
+else
+  dim "no flags auto-found — dig manually (see next steps)"
+fi
+
+# ---- 9. done -------------------------------------------------------------
+sec "DONE"
+mkout; printf '%s' "$CMDS" > "$OUT/commands.log"     # full command log always saved
+note "flag format: ${PREFIXES[*]}  (edit $FMT_FILE or set CTF_FLAG_FORMAT=)"
+[ -d "$OUT" ] && note "artifacts in: $OUT/  (command log: $OUT/commands.log)"
+[ "$VERBOSE" = 0 ] && note "re-run with -v to see every command as it runs"
+note "next: strings -n 6 \"$F\" | less   ·   Wireshark/Volatility for pcap/memory dumps"

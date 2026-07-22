@@ -1,0 +1,4 @@
+# ctf-file writes everything it extracts into ./<file>-work/
+*-work/
+# decompressed wordlist cache
+wordlists/

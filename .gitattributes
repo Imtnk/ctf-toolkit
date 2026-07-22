@@ -1,0 +1,4 @@
+# These are Linux shell scripts — always check out with LF, never CRLF,
+# so they run on Kali even when cloned on Windows.
+ctf-file  text eol=lf
+*.sh      text eol=lf
