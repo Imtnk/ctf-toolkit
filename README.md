@@ -1,206 +1,223 @@
-# ctf-file
+# CTF Toolchain — Mac Model Server
 
-**One-command first-pass forensics triage for a single file.** Point it at a mystery
-file from a CTF and it runs the whole recon reflex — identify → strings → metadata →
-carving → steganography → password guessing → auto-decode — then prints a colour-coded
-report ending in a **SUMMARY** of everything that looks like a flag.
+This Mac (M3 Pro, 18 GB) runs **Ollama** and serves models over the LAN to a Kali WSL2 box
+that runs the actual CTF tooling.
 
-It is **read-only on your file**; anything it extracts is written to `./<file>-work/`.
-Every external tool is optional — missing tools are skipped, never fatal.
+> [!important] Scope
+> A 14B local model is a strong **triage-and-scaffold assistant** with the human driving strategy —
+> not an autonomous pwn-solver. It loses the thread over long, messy contexts and pattern-matches
+> the wrong exploit class without correction. The agent compensates with per-turn `thought`,
+> small subtasks, verification-before-finish, and mid-run steering. README claims match that ceiling.
 
-```
-$ ctf-file locked.zip
-=== IDENTIFY ===
-  type : Zip archive data, at least v2.0 to extract
-=== PASSWORD GUESSING (start: common list) ===
-  >> password FOUND: 'dragon'  (zip)
-  >> flag: flag{cracked_the_zip}
-=== SUMMARY ===
-  1 finding(s):
-   * ARCHIVE zip (pw=dragon): flag{cracked_the_zip}
-```
+> [!success] Status (2026-07-21)
+> All six implementation phases complete. One-shot and agent modes verified.
 
 ---
 
-## Requirements
+## Models
 
-- **Kali Linux** (tested on base/rolling). It's plain `bash` + standard CLI forensics
-  tools, so it also runs on Debian/Ubuntu/WSL with the same packages installed.
-- `bash` 4+, and the GNU coreutils that ship with Kali (`file`, `stat`, `xxd`,
-  `strings`, `tr`, `base64`, `find`, `xargs`, `sort`, `sed`, `awk`).
+| Model | Role | Size |
+|---|---|---|
+| `deepseek-r1:14b` | **Primary** — chain-of-thought reasoning, CTF triage | ~9 GB |
+| `qwen2.5-coder:14b` | Coding-focused alternative | ~9 GB |
+| `dolphin-llama3:8b` | Uncensored fallback (auto-triggered on refusal) | ~5 GB |
+| `nomic-embed-text` | Embeddings (pre-existing) | 274 MB |
 
-The forensics tools it *drives* (all optional — each is guarded, and skipped with a
-note if absent) are installed for you by `install.sh`:
-
-| Tool | Package (Kali) | Used for |
-|------|----------------|----------|
-| `file`, `xxd`, `strings` | `file`, `xxd`, `binutils` | identify / magic bytes / strings |
-| `exiftool` | `libimage-exiftool-perl` | metadata |
-| `binwalk`, `foremost` | `binwalk`, `foremost` | carving / embedded files (foremost = fallback) |
-| `unzip` | `unzip` | zip extraction |
-| `john` (+ `zip2john`, `rar2john`, `pdf2john.pl`, `office2john.py`) | `john` | archive password cracking |
-| `steghide`, `stegseek`, `outguess` | `steghide`, `stegseek`, `outguess` | JPEG/BMP/WAV stego + passphrase cracking |
-| `zsteg` | `gem install zsteg` (needs `ruby`) | PNG/BMP LSB stego |
-| `pngcheck` | `pngcheck` | PNG structure |
-| `tshark`, `tcpflow`, `capinfos` | `tshark`, `tcpflow` | **pcap**: objects, creds, stream reassembly |
-| `pdfinfo`/`pdfimages`/`pdfdetach` | `poppler-utils` | **pdf**: embedded images + attachments |
-| `olevba` | `python3-oletools` | **office**: VBA macro dump |
-| `zbarimg` | `zbar-tools` | **QR / barcode** decoding |
-| `sox` | `sox` | **audio**: spectrogram render |
-| `mmls`/`fls`/`icat`, `testdisk` | `sleuthkit`, `testdisk` | **disk images** (`--heavy`) |
-| `vol` (Volatility3) | `pipx install volatility3` | **memory dumps** (`--heavy`) |
-| rockyou wordlist | `wordlists` | medium/hard cracking tiers |
-
-> **Base Kali note:** a minimal (`kali-linux-core`) install does **not** ship most of
-> these. Run `install.sh` (below) — it installs everything via `apt`, one `gem`, and
-> `pipx` (Volatility3). Missing tools are always skipped gracefully, never fatal.
+Only one 14B model fits in RAM alongside OS headroom. Use `switch-model.sh` to swap.
 
 ---
 
-## Install
+## Quick start
 
-```bash
-git clone <this-repo-url> ctf-file
-cd ctf-file
-./install.sh
-```
-
-`install.sh`:
-1. `sudo apt-get install`s the packages in the table above (and `wordlists`),
-2. `gem install zsteg` (installs `ruby` first if needed),
-3. copies the `ctf-file` script to `~/.local/bin/ctf-file` (or `~/bin`) and `chmod +x`,
-4. makes sure that directory is on your `PATH` (adds a line to `~/.bashrc` if missing).
-
-Open a new shell (or `source ~/.bashrc`) and `ctf-file -h` should print the manual.
-
-### Manual install (no script)
-
-```bash
-sudo apt-get update
-sudo apt-get install -y file binutils xxd binwalk libimage-exiftool-perl unzip \
-                        john steghide stegseek pngcheck ruby wordlists
-sudo gem install zsteg
-
-install -Dm755 ctf-file ~/.local/bin/ctf-file
-# ensure ~/.local/bin is on PATH:
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
-```
-
-You can also just run it in place without installing: `./ctf-file <file>`.
-
----
-
-## Usage
-
-```
-ctf-file <file> [-d easy|medium|hard] [-c] [-n] [-v] [-w wordlist] [-h]
-```
-
-```bash
-ctf-file suspicious.bin        # full read-only sweep; prompts before heavy cracking
-ctf-file locked.zip            # common-list crack cracks a weak password instantly
-ctf-file photo.jpg -d hard     # non-interactive: escalate straight to rockyou + john rules
-ctf-file dump.raw -n           # skip auto-extraction (big disk/memory image)
-ctf-file chall.png -v          # verbose: echo every underlying tool command as it runs
-ctf-file chall.png -w list.txt # use a custom wordlist instead of rockyou
-ctf-file -h                    # full man-page style manual
-```
-
-### Options
-
-| Option | Meaning |
-|--------|---------|
-| `-d easy\|medium\|hard` | Force the cracking effort and skip the interactive prompts. **easy** = built-in common list only (instant); **medium** = common list then rockyou; **hard** = common list then rockyou + john mangling rules. |
-| `-c` | Non-interactive escalation: run the wordlist tier automatically (pairs with `-d`). |
-| `-n` | Don't auto-extract embedded files (skip `binwalk -e`, zip, pcap-object, and pdf extraction). |
-| `-H`, `--heavy` | Enable the slow **DEEP ANALYSIS** pass on disk images (Sleuth Kit) and memory dumps (Volatility3). Off by default — without it those are only detected and suggested commands are printed. |
-| `-v`, `--verbose` | Echo every underlying tool command as it runs. |
-| `-w <path>` | Use this wordlist instead of rockyou for medium/hard. |
-| `-h`, `--help` | Show the full manual. |
-
-If `-d` is omitted and you're at a terminal, `ctf-file` tries the common list first, then
-**prompts** (`y/N`, read from `/dev/tty`) before escalating to rockyou, then to rockyou +
-rules. Piped or non-interactive runs never prompt — they save the hash and tell you to
-re-run with `-c`.
-
----
-
-## Flag format — what it searches for
-
-The prefix(es) it hunts (the part before `{`) are resolved in priority order:
-
-1. **`CTF_FLAG_FORMAT`** env var — `CTF_FLAG_FORMAT=ctf ctf-file chall` (comma/space
-   separated for several).
-2. **`~/.config/ctf-file/format`** — one prefix per line, `#` comments allowed.
-3. Built-in default: `flag ctf key`.
-
-"Just the beginning" is enough — put `ctf` to hunt `ctf{...}`. The **rot13 form of each
-prefix is derived automatically** (`flag`→`synt`, `ctf`→`pgs`), so a rot13-encoded flag is
-still detected in STRINGS and AUTO-DECODE.
-
-```bash
-mkdir -p ~/.config/ctf-file
-printf 'ctf\n' > ~/.config/ctf-file/format      # this event uses ctf{...}
+```zsh
+brew services list | grep ollama     # Ollama runs as a launchd service (auto-starts at login)
+curl -s http://localhost:11434       # → "Ollama is running"
+ipconfig getifaddr en0               # LAN IP for Kali (currently 192.168.1.11; DHCP — may drift)
 ```
 
 ---
 
-## What each section does
+## `ai.py` — one-shot and agent modes
 
-| Section | Tools | Notes |
-|---------|-------|-------|
-| **IDENTIFY** | `file`, `stat`, `xxd` | real type + magic bytes (ignores the extension) |
-| **STRINGS** | `strings` (ASCII + UTF-16LE) | greps for `flag{`/`synt{`/`ctf{`/`key{` |
-| **METADATA** | `exiftool` | EXIF / doc properties (filesystem noise filtered) |
-| **CARVING** | `binwalk`, `foremost`, `unzip`, `poppler-utils` | auto-extracts embedded files (foremost fallback); pulls **pdf** images/attachments; greps carved data |
-| **NETWORK** | `tshark`, `tcpflow`, `capinfos` | **pcap only**: protocol hierarchy, HTTP requests/objects, cleartext creds, TCP-stream reassembly → flag-grep |
-| **STEGANOGRAPHY** | `pngcheck`, `zsteg`, `steghide`, `outguess`, `zbarimg`, `sox` | **images/audio only**: LSB, passphrase, QR/barcode, audio spectrogram |
-| **PASSWORD GUESSING** | `*2john` + `john`, `steghide`, `stegseek`, `olevba` | common list first, then escalate; **office** macro dump |
-| **AUTO-DECODE** | `tr`, `base64` | ROT13 / base64 on flag-like strings |
-| **DEEP ANALYSIS** (`--heavy`) | `mmls`/`fls`/`icat`, `vol` | **disk images**: partition table + filesystem walk; **memory dumps**: Volatility3 |
-| **SUMMARY** | — | every finding collected in one list |
+### `ai` — menu + shortcut
 
-Password guessing always tries a cheap built-in **common list first** (empty, `password`,
-`123456`, `dragon`, `flag`, the filename, …), at every tier. Only if that misses does it
-escalate to rockyou (automatically with `-d`/`-c`, or by prompting interactively). A
-cracked **zip is auto-extracted** and its flag shown.
+`ai-ui.py` is a thin launcher aliased to **`ai`** (in `~/.bashrc` and `~/.zshrc`). Bare
+`ai` opens an interactive menu (ask / run agent / resume, with toggles for local-vs-remote
+brain, approve-auto, and dry-run); any arguments pass straight through to `ai.py`:
 
----
+```zsh
+ai                          # interactive menu (shows the current brain)
+ai "find the vulnerability" # one-shot passthrough
+ai agent "triage ./chal"    # agent passthrough (all ai.py flags work)
+```
 
-## Output & exit status
+### One-shot (backward-compatible)
 
-- Report on **stdout**; the progress bar + spinner on **stderr** (interactive terminals only).
-- Everything extracted goes to `./<file>-work/`, including `commands.log` — the full list
-  of every real command the run issued (always saved, reproducible).
-- **Exit 0** on success, **1** on a usage error / missing file.
-- Colour, the progress bar and prompts are TTY-gated: piping the output anywhere
-  (`ctf-file chall.png | less`, into another tool, or to a file) yields clean plain text.
-  `NO_COLOR=1` forces colour off.
+```zsh
+echo "solve this RSA: n=... e=... c=..." | python3 ai.py
+cat challenge.py | python3 ai.py "find the vulnerability"
+python3 ai.py "what does XOR with a repeating key look like in ciphertext?"
+```
 
----
+Sends a single prompt to Ollama and prints the response. No tools, no loop.
 
-## Safety notes
+### Agent mode — ReAct loop with tools
 
-- **Read-only on the input.** All writes go to `./<file>-work/`, which is cleared at the
-  start of each run.
-- **Untrusted extraction is guarded.** `binwalk -e` drives external extractors on
-  attacker-controlled data (RCE / zip-slip class, cf. CVE-2022-4510), so it is **never**
-  run as root / with `--run-as=root`. Extracted symlinks whose target escapes the work dir
-  are flagged and ignored; all flag-greps read **regular files only**, so nothing outside
-  the work dir is ever trusted as a flag. Still: run it as a normal user, ideally in a VM
-  or throwaway directory when triaging genuinely untrusted files.
+```zsh
+python3 ai.py agent "what type is ./chal and what are its strings?"
+python3 ai.py agent --approve auto "triage ./chal — architecture, protections, interesting strings"
+python3 ai.py agent --dry-run "what would you do with ./chal?"
+python3 ai.py agent -m dolphin "exploit the vuln in ./vuln.py"
+cat chal.py | python3 ai.py agent "find and explain the vulnerability"
 
----
+# Resume a crashed or interrupted run
+python3 ai.py agent --resume
+python3 ai.py agent --resume .agent/run-20260721-143022.jsonl
+```
 
-## Extending it
-
-It's a single self-contained bash script. Add a section by copying the `sec "NAME"`
-pattern (each `sec` call also advances the progress bar — bump `TOTAL` if you add one).
-Good next additions: `pdfimages`/`pdfdetach` for PDFs, `tshark` summary for pcaps,
-`volatility` for memory dumps.
+| Flag | Default | Meaning |
+|---|---|---|
+| `-m / --model` | brain default | Override with a specific **local** Ollama model id |
+| `--local` | off | Force the local Ollama brain instead of the remote gateway |
+| `--approve auto` | manual | Skip prompts for non-allowlisted commands |
+| `--dry-run` | off | Show planned commands; execute nothing |
+| `--max-steps` | 15 | Steps before soft-budget prompt |
+| `--resume [FILE]` | — | Resume latest (or specific) `.agent/*.jsonl` transcript |
 
 ---
 
-## License
+## Brain: remote gateway vs local Ollama
 
-MIT — see [LICENSE](LICENSE).
+The agent's **brain** (reasoning) is decoupled from its **hands** (`agent/tools.py`, which run
+real subprocesses). By default the brain is a large hosted model on an **OpenAI-compatible
+gateway**; the local machine still executes every tool. A local `dolphin-llama3:8b` remains the
+refusal fallback.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `CTF_REMOTE_API_KEY` | *(unset)* | **Secret.** Bearer key for the gateway. Sourced from `~/.config/ctf-toolchain/secrets.env` (chmod 600, outside this repo). Never commit it. |
+| `CTF_REMOTE_MODEL` | `qwen3.6-35b-a3b` | Remote model id |
+| `CTF_REMOTE_BASE_URL` | `https://gateway.9arm.co/v1` | OpenAI-compatible base (`POST {base}/chat/completions`) |
+| `CTF_BRAIN` | `remote` | Set to `local` to force the Ollama brain globally |
+| `CTF_AI_HOST` | `localhost` | Ollama host for the local brain / fallback |
+
+**Selection:** remote is used when a key is present and neither `CTF_BRAIN=local`, `--local`, nor
+`-m <model>` is in play. With no key it degrades to local `deepseek-r1:14b` (a one-time warning is
+printed); `ctf-eval` degrades further to its offline heuristic if Ollama is also unreachable.
+
+One-time key setup (paste the real key yourself — it never needs to pass through anyone else):
+
+```zsh
+printf 'export CTF_REMOTE_API_KEY=%q\n' 'sk-REAL' >> ~/.config/ctf-toolchain/secrets.env
+# secrets.env is chmod 600 and sourced from ~/.bashrc and ~/.zshrc
+```
+
+---
+
+## Agent loop
+
+Each turn: **model → JSON `{thought, tool, args}` → approval → execute → observe → repeat**
+
+### Tools
+
+| Tool | Approval tier | Purpose |
+|---|---|---|
+| `run_shell(cmd)` | allowlist / ask / deny | Shell command; streams output line-by-line |
+| `python_exec(code)` | ask (denylist scanned) | Python snippet; pwntools/pycryptodome/z3 |
+| `read_file(path)` | auto (read-only) | Text file, 8 KB cap |
+| `write_file(path, text)` | always diff+confirm | Diff shown before any write |
+| `list_dir(path)` | auto | Directory listing with sizes |
+| `file_info(path)` | auto | `file` command + size + SHA-256 |
+| `hexdump(path, n)` | auto | First n bytes, hex+ASCII |
+| `strings(path, min_len)` | auto | Printable strings (system `strings` + Python fallback) |
+| `http_request(method, url, …)` | ask | Web challenge requests via urllib |
+| `finish(answer)` | — | End loop; triggers verification step first |
+
+### Approval tiers
+
+1. **auto** (allowlist) — `file`, `strings`, `ls`, `cat`, `grep`, `hexdump`, `nmap`, `objdump`, `readelf`, `binwalk` (without `-e`), `base64`, `openssl` inspect ops, … — runs silently
+2. **ask** — everything else; prompt shows `[y] once / [a] always / [N] deny`; "a" appends a prefix rule to the session allowlist
+3. **deny** (denylist) — `rm -rf`, `sudo`, `curl|sh`, `dd of=/dev/`, fork bombs, `shred` — hard-blocked even under `--approve auto`
+
+### Loop guards
+
+- **Repeat detection** — duplicate tool+args hash → injects "you already ran this" and skips
+- **No-progress heuristic** — 3 consecutive empty/duplicate observations → pause prompt
+- **Soft budget** — at `--max-steps`: continue 10 more / stop / inject hint / enter answer
+- **Mid-run steering** — type and press Enter at any time; injected as `[user hint]` without restarting
+- **Verification before finish** — proposed answer goes through a separate classification call
+- **Refusal fallback** — refusal detected via a clean-context classifier call (not substring-matching tool output); auto-switches to `dolphin-llama3:8b`
+
+### Context management
+
+- Pinned facts (task, flag format, confirmed findings) survive truncation
+- Messages pruned above 40; last 12 preserved alongside pinned block
+- Flag-like strings (`WORD{...}`) auto-extracted from observations into pinned findings
+
+### Transcript + resume
+
+Every step appended to `.agent/run-YYYYMMDD-HHMMSS.jsonl`. `--resume` reloads message history and continues. System prompt rebuilt fresh on resume (catalog changes take effect).
+
+---
+
+## Helper scripts
+
+```zsh
+./switch-model.sh deepseek   # load deepseek-r1:14b (primary)
+./switch-model.sh coder      # load qwen2.5-coder:14b
+./switch-model.sh dolphin    # load dolphin-llama3:8b (uncensored / RAM-saver)
+./switch-model.sh status     # ollama ps + ollama list
+
+./start-ollama.sh            # start service, confirm localhost + LAN reachable
+./stop-ollama.sh             # stop service to free RAM (e.g. before Ghidra)
+./test-server.sh             # health check: reachable, models present, generation works
+./test-server.sh 192.168.1.11   # same check from Kali over LAN
+```
+
+---
+
+## From Kali
+
+Point the Kali-side helper at the Mac over the LAN. `ai.py` and the agent read the
+**`CTF_AI_HOST`** env var (default `localhost`), so no code edit is needed:
+
+```zsh
+export CTF_AI_HOST=192.168.1.11   # Mac's LAN IP (DHCP — may drift; see below)
+python3 ai.py agent "triage ./chal"
+```
+
+> [!note] IP drift
+> The Mac is on DHCP and its LAN IP has drifted (`192.168.1.124` → `192.168.1.11`). Set a
+> **DHCP reservation** on the router for a permanent address; until then `CTF_AI_HOST` covers it.
+
+See `[[local-ai-ctf-setup]]` section 07–08 for connectivity setup and tests.
+
+> [!warning]
+> Always pass `"num_ctx": 8192` in API calls — Ollama defaults to 2048 on some builds and will
+> truncate long responses mid-stream. `ai.py` already sets this.
+
+---
+
+## Architecture
+
+```
+ctf-toolchain/
+  ai.py              # CLI: one-shot (unchanged) + agent subcommand
+  agent/
+    config.py        # host / model / limits
+    llm.py           # Ollama /api/chat wrapper
+    protocol.py      # JSON extractor (handles <think> tags, ```json fences, nested braces)
+    tools.py         # tool registry (10 tools, streaming run_shell + python_exec)
+    approval.py      # three-tier gate + session-learned allowlist + check_write diff
+    loop.py          # ReAct loop (all guards, steering, truncation, transcript writes)
+    transcript.py    # .agent/*.jsonl write + load_resume
+    refusal.py       # clean-context refusal classifier + dolphin fallback
+    context.py       # pinned-facts + maybe_truncate
+  switch-model.sh
+  start-ollama.sh / stop-ollama.sh
+  test-server.sh
+  AGENT-PLAN.md      # original implementation plan
+```
+
+Dependencies: **stdlib only** (`urllib`, `json`, `subprocess`, `threading`, `select`, `difflib`).
+CTF power comes from shelling out to the installed toolset (pwntools, pycryptodome, z3, binwalk, …).

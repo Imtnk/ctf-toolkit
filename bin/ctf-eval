@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+"""ctf-eval — run ctf-file triage on a file, then have an AI evaluate the report.
+
+Evaluator, in priority order: the remote brain (OpenAI-compatible gateway) when a key
+is set, else a local Ollama model, else a deterministic offline heuristic. Standalone
+(no ai.py dependency). See the Brain note below for selection + env vars.
+
+Usage:
+  ctf-eval <file>                     # triage + eval with the remote brain (default, if a key is set)
+  ctf-eval <file> --local             # force local deepseek instead of the remote brain
+  ctf-eval <file> --fast              # local qwen2.5-coder (faster, no <think>) — implies --local
+  ctf-eval <file> --model dolphin-llama3:8b   # a specific local Ollama model — implies --local
+  ctf-eval <file> --offline           # skip all models, deterministic heuristic eval
+  ctf-eval <file> -- -d hard -c       # everything after `--` is passed to ctf-file
+  ctf-eval -h
+
+Brain: the default evaluator is the remote OpenAI-compatible gateway (model CTF_REMOTE_MODEL)
+when CTF_REMOTE_API_KEY is set and CTF_BRAIN != local. Without a key it uses the local Ollama
+model; if that's unreachable it degrades to the offline heuristic. The key is read from the env
+(sourced from ~/.config/ctf-toolchain/secrets.env) and is never logged.
+
+Reads the ctf-file artifact folder (./<file>-work/) too — extracted payloads, cracked
+archives, stego dumps, commands.log — and feeds BOTH the triage report and those
+artifacts to the evaluator, so a flag sitting only inside an extracted file (never
+echoed to stdout) still counts as ground truth. The artifact layout is discovered
+generically (a plain walk of the folder), so tools added to ctf-file need no changes here.
+
+Outputs (all under ./<file>-work/):
+  triage-report.txt   full ctf-file output (ground truth)
+  eval-trace.txt      raw model reply incl. <think> block (deepseek reasoning)
+  eval.json           structured verdict (schema below), version-stamped
+
+Model reply schema (enforced + parsed):
+  VERDICT / FLAG / CONFIDENCE / WHY / NEXT_STEPS / COMMANDS
+"""
+import os, sys, re, json, shutil, subprocess, urllib.request, urllib.error
+from datetime import datetime, timezone
+
+VERSION   = "1.0"
+MAC_IP    = os.environ.get("CTF_AI_HOST", "192.168.1.11")   # Mac's LAN IP (DHCP — set CTF_AI_HOST if it drifts)
+BASE_URL  = f"http://{MAC_IP}:11434"
+CHAT_URL  = f"{BASE_URL}/api/chat"
+
+# ── Remote "brain" (OpenAI-compatible gateway) ────────────────────────────────
+# Default evaluator when a key is present. Only the KEY is secret — it comes from
+# the env (sourced from ~/.config/ctf-toolchain/secrets.env, chmod 600, out of any repo).
+# ctf-eval can't import the agent package, so this mirrors agent/config.py + agent/llm.py.
+REMOTE_MODEL   = os.environ.get("CTF_REMOTE_MODEL", "qwen3.6-35b-a3b")
+REMOTE_BASE    = os.environ.get("CTF_REMOTE_BASE_URL", "https://gateway.9arm.co/v1").rstrip("/")
+REMOTE_KEY     = os.environ.get("CTF_REMOTE_API_KEY", "")
+REMOTE_TIMEOUT = int(os.environ.get("CTF_REMOTE_TIMEOUT", "300"))
+REMOTE_ENABLED = os.environ.get("CTF_BRAIN", "remote").lower() != "local"
+REMOTE_MAX_TOKENS = int(os.environ.get("CTF_REMOTE_MAX_TOKENS", "4096"))  # bound output; leaves room for reasoning + answer
+# Gateway is behind Cloudflare, which 403s (error 1010) the default urllib UA.
+REMOTE_UA      = os.environ.get(
+    "CTF_REMOTE_USER_AGENT",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+# The remote model has a much larger context window than the local one, so give
+# it more of the report + extracted artifacts than the local-sized caps below.
+REMOTE_REPORT_CAP        = int(os.environ.get("CTF_REMOTE_REPORT_CAP", "60000"))
+REMOTE_ARTIFACT_FILE_CAP  = 12000
+REMOTE_ARTIFACT_TOTAL_CAP = 32000
+
+DEEPSEEK  = "deepseek-r1:14b"          # default: reasoning model (emits <think>)
+QWEN      = "qwen2.5-coder:14b"        # --fast
+DOLPHIN   = "dolphin-llama3:8b"        # reachable via --model; NOT an auto-fallback on the eval path (D5)
+# D1 (resolved 2026-07-22): eval default stays deepseek-r1:14b, but keep_alive is 5m not 30m —
+# deepseek evicts qwen-coder (can't co-reside in 18 GB), so a short pin covers a burst of evals
+# then releases qwen within 5 min. See §11 thread D1.
+KEEPALIVE = os.environ.get("CTF_EVAL_KEEPALIVE", "5m")    # F10: brief warm-pin (batch-friendly)
+# D2 (resolved 2026-07-22): during an eval deepseek runs SOLO (qwen evicted), so the bigger KV
+# cache has headroom on 18 GB. If D1 ever flips to the co-resident 8b+14b pair, drop back to 8192.
+NUM_CTX   = 16384
+REPORT_CAP = 24000                     # chars sent to the model (~6k tokens, fits num_ctx w/ reasoning)
+
+# flag-shaped token, e.g. flag{...} ctf{...} key{...} synt{...}
+FLAG_RE = re.compile(r"\b[A-Za-z0-9_]{2,12}\{[^}\r\n]{1,120}\}")
+
+SCHEMA_KEYS = ["VERDICT", "FLAG", "CONFIDENCE", "WHY", "NEXT_STEPS", "COMMANDS"]
+
+SYSTEM = (
+    "You are a CTF forensics evaluator. You are given the raw output of an automated "
+    "triage tool (ctf-file) AND the contents of the files it extracted into the work "
+    "folder. Both the report and those artifacts are GROUND TRUTH: never invent a flag, a "
+    "decode, or a command result that is not supported by them. If the report or any "
+    "artifact contains a flag, report it VERBATIM. If none does, do NOT guess one — say so and "
+    "give the single most valuable next action.\n\n"
+    "Do NOT try to decode, deobfuscate, decrypt, or transform any data in your head "
+    "(base64, hex, rot13, decompression, etc.) — mentally decoding is error-prone and "
+    "forbidden. If an artifact looks encoded or compressed, that is a NEEDS_MORE_WORK "
+    "finding: name the artifact in WHY and put the EXACT decode command (e.g. "
+    "`base64 -d <file>`) in COMMANDS. Keep your reasoning brief and never repeat text.\n\n"
+    "Reply with EXACTLY these six fields, each on its own line, nothing before or after:\n"
+    "VERDICT: <SOLVED | NEEDS_MORE_WORK | INCONCLUSIVE>\n"
+    "FLAG: <the flag verbatim, or NONE>\n"
+    "CONFIDENCE: <HIGH | MEDIUM | LOW>\n"
+    "WHY: <one sentence tying the verdict to evidence in the report>\n"
+    "NEXT_STEPS: <if not solved, 1-3 concrete next actions; else NONE>\n"
+    "COMMANDS: <exact shell command(s) for the next step, or NONE>"
+)
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------- ctf-file
+def resolve_ctf_file():
+    p = shutil.which("ctf-file")
+    if p:
+        return p
+    cand = os.path.expanduser("~/bin/ctf-file")
+    return cand if os.path.isfile(cand) else None
+
+
+def run_triage(ctf_file, target, passthrough, report_path):
+    env = dict(os.environ, NO_COLOR="1")
+    cmd = [ctf_file, target] + passthrough
+    eprint(f"[ctf-eval] triage: {' '.join(cmd)}")
+    try:
+        proc = subprocess.run(cmd, env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, timeout=1200)
+        out = proc.stdout
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or "") + "\n[ctf-eval] triage timed out after 1200s\n"
+    # ctf-file rm -rf's the work dir at startup and only recreates it if it extracts
+    # something — ensure it exists before we drop our report in.
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+    with open(report_path, "w", encoding="utf-8", errors="replace") as f:
+        f.write(out)
+    return out
+
+
+# ---------------------------------------------------------------- Ollama
+def server_up(timeout=4):
+    try:
+        with urllib.request.urlopen(BASE_URL, timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def stream_chat(model, system, prompt, echo, think=True):
+    """Stream a reply. Returns (answer, reasoning).
+
+    Reasoning-capable models (deepseek-r1) return their chain-of-thought in a separate
+    `message.thinking` field when `think:true` — captured here for the trace, kept OUT of the
+    answer that drives the verdict (F2). Models that don't support thinking (qwen --fast) 400 on
+    `think:true`; we transparently retry without it."""
+    def _run(with_think):
+        body = {
+            "model": model, "stream": True, "keep_alive": KEEPALIVE,
+            "options": {"num_ctx": NUM_CTX, "temperature": 0.1},
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": prompt}],
+        }
+        if with_think:
+            body["think"] = True
+        req = urllib.request.Request(CHAT_URL, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        ans, rsn = [], []
+        with urllib.request.urlopen(req) as r:      # no read timeout: cold 14B is slow
+            for line in r:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line).get("message", {})
+                except json.JSONDecodeError:
+                    continue
+                t = msg.get("thinking", "")
+                c = msg.get("content", "")
+                if t:
+                    rsn.append(t)
+                    if echo:
+                        sys.stderr.write(f"\033[90m{t}\033[0m" if sys.stderr.isatty() else t)
+                        sys.stderr.flush()
+                if c:
+                    ans.append(c)
+                    if echo:
+                        sys.stderr.write(c); sys.stderr.flush()
+        if echo:
+            sys.stderr.write("\n"); sys.stderr.flush()
+        return "".join(ans), "".join(rsn)
+
+    try:
+        return _run(think)
+    except urllib.error.HTTPError as e:
+        if think and e.code == 400:      # model doesn't support thinking — retry plain
+            return _run(False)
+        raise
+
+
+def remote_chat(system, prompt, echo=False):
+    """OpenAI-compatible chat completion against the remote gateway, STREAMING.
+
+    Returns (content, reasoning). Streams SSE deltas and echoes them to stderr
+    (when `echo`) so the user sees the brain's output live and a Ctrl+C lands
+    between chunks; accumulates the full reply. Falls back to non-streaming if
+    the gateway rejects streaming. `reasoning_content`, if present, is captured
+    for the trace. The API key is NEVER echoed — not in logs nor error messages."""
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": prompt}]
+
+    def _open(stream):
+        body = json.dumps({
+            "model": REMOTE_MODEL, "temperature": 0.1,
+            "max_tokens": REMOTE_MAX_TOKENS, "stream": stream,
+            "messages": messages,
+        }).encode()
+        req = urllib.request.Request(
+            f"{REMOTE_BASE}/chat/completions", data=body,
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {REMOTE_KEY}",
+                     "User-Agent": REMOTE_UA})
+        return urllib.request.urlopen(req, timeout=REMOTE_TIMEOUT)
+
+    def _stream():
+        ans, rsn = [], []
+        with _open(True) as r:
+            for raw in r:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                d = line[5:].strip()
+                if d == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(d)
+                except json.JSONDecodeError:
+                    continue
+                delta = (chunk.get("choices") or [{}])[0].get("delta", {}) or {}
+                t = delta.get("reasoning_content") or ""
+                c = delta.get("content") or ""
+                if t:
+                    rsn.append(t)
+                    if echo:
+                        sys.stderr.write(f"\033[90m{t}\033[0m" if sys.stderr.isatty() else t)
+                        sys.stderr.flush()
+                if c:
+                    ans.append(c)
+                    if echo:
+                        sys.stderr.write(c); sys.stderr.flush()
+            if echo:
+                sys.stderr.write("\n"); sys.stderr.flush()
+        return "".join(ans), "".join(rsn)
+
+    def _nonstream():
+        with _open(False) as r:
+            data = json.load(r)
+        msg = data["choices"][0]["message"]
+        return msg.get("content", "") or "", msg.get("reasoning_content", "") or ""
+
+    try:
+        return _stream()
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 404, 405):
+            return _nonstream()
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {e.code}: {detail}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"unreachable ({REMOTE_BASE}): {e.reason}") from None
+
+
+def split_think(raw):
+    """F2: separate deepseek <think>...</think> reasoning from the final answer."""
+    m = re.search(r"<think>(.*?)</think>", raw, re.DOTALL)
+    if m:
+        answer = (raw[:m.start()] + raw[m.end():]).strip()
+        return answer, raw
+    # unclosed think (truncated): keep everything after the tag as answer-ish
+    if "<think>" in raw:
+        return raw.split("<think>", 1)[0].strip() or raw, raw
+    return raw.strip(), raw
+
+
+# ---------------------------------------------------------------- parsing
+def parse_schema(answer):
+    """Slice the six known fields out of the model reply (robust to extra prose)."""
+    fields = {k: "" for k in SCHEMA_KEYS}
+    # positions of each 'KEY:' at line start
+    hits = []
+    for k in SCHEMA_KEYS:
+        m = re.search(rf"(?im)^\s*{k}\s*:", answer)
+        if m:
+            hits.append((m.start(), m.end(), k))
+    hits.sort()
+    for i, (_, end, k) in enumerate(hits):
+        nxt = hits[i + 1][0] if i + 1 < len(hits) else len(answer)
+        fields[k] = answer[end:nxt].strip()
+    return fields
+
+
+def norm_none(v):
+    return "" if v.strip().upper() in ("", "NONE", "N/A", "UNKNOWN") else v.strip()
+
+
+def as_list(v):
+    v = norm_none(v)
+    if not v:
+        return []
+    items = re.split(r"\n+|\s*(?:\d+[.)]|[-*•])\s+", v)
+    return [x.strip(" -*•\t") for x in items if x.strip(" -*•\t")]
+
+
+def report_flags(report):
+    seen, out = set(), []
+    for m in FLAG_RE.findall(report):
+        if m not in seen:
+            seen.add(m); out.append(m)
+    return out
+
+
+# ---------------------------------------------------------------- artifacts
+# ctf-eval's OWN outputs live in the same <file>-work dir — never scan them back in
+# as ctf-file artifacts (that would feed our own verdict to ourselves).
+OWN_OUTPUTS = {"triage-report.txt", "eval-trace.txt", "eval.json"}
+# Fixed inputs, not findings: listed in the manifest but never inlined for the model.
+ARTIFACT_INLINE_SKIP = {"common.lst"}
+ARTIFACT_FILE_CAP  = 4000      # max chars inlined from any one artifact file
+ARTIFACT_TOTAL_CAP = 8000      # max chars inlined across all artifacts (fits alongside REPORT_CAP)
+
+
+def _looks_text(chunk):
+    if b"\x00" in chunk:
+        return False
+    try:
+        chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        # allow mostly-utf8 payloads that only tripped on a truncated tail multibyte
+        try:
+            chunk[:-3].decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+    return True
+
+
+def scan_artifacts(work, file_cap=ARTIFACT_FILE_CAP, total_cap=ARTIFACT_TOTAL_CAP):
+    """Walk the ctf-file artifact folder generically.
+
+    file_cap/total_cap bound how much artifact text is inlined for the model —
+    the remote brain (bigger context window) passes larger caps than the local one.
+
+    Returns (manifest, inlined_text, art_flags):
+      manifest     list of {"path", "size", "kind": text|binary|unreadable}, ctf-eval's
+                   own outputs excluded — a tools-agnostic inventory of what ctf-file left.
+      inlined_text path-headed contents of small text artifacts, capped for the prompt.
+      art_flags    flag-shaped tokens found in ANY text artifact (ground truth, e.g. a
+                   flag sitting in unzip/flag.txt that never reached stdout).
+    """
+    manifest, art_flags, seen = [], [], set()
+    inl_parts, inl_total = [], 0
+    if not os.path.isdir(work):
+        return manifest, "", art_flags
+    for root, dirs, files in os.walk(work):
+        dirs.sort(); files.sort()
+        for name in sorted(files):
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, work).replace(os.sep, "/")
+            if rel in OWN_OUTPUTS:
+                continue
+            try:
+                size = os.path.getsize(full)
+                with open(full, "rb") as f:
+                    chunk = f.read(file_cap * 4 + 8)
+            except OSError:
+                manifest.append({"path": rel, "size": -1, "kind": "unreadable"})
+                continue
+            text = _looks_text(chunk)
+            manifest.append({"path": rel, "size": size, "kind": "text" if text else "binary"})
+            if not text:
+                continue
+            s = chunk.decode("utf-8", "replace")
+            for m in FLAG_RE.findall(s):          # flag scan over every text artifact
+                if m not in seen:
+                    seen.add(m); art_flags.append(m)
+            # inline small, useful text artifacts for the model (skip fixed inputs / once full)
+            if name in ARTIFACT_INLINE_SKIP or inl_total >= total_cap:
+                continue
+            body = s[:file_cap]
+            if len(s) > file_cap or size > len(chunk):
+                body += "\n…[truncated]"
+            block = f"--- {rel} ({size} bytes) ---\n{body}"
+            inl_parts.append(block); inl_total += len(block)
+    return manifest, "\n\n".join(inl_parts), art_flags
+
+
+# ---------------------------------------------------------------- eval build
+def heuristic_eval(report, rflags, reason):
+    """F16: deterministic offline verdict from the report alone."""
+    if rflags:
+        return {
+            "verdict": "SOLVED", "flag": rflags[0], "flag_verified": True,
+            "confidence": "HIGH",
+            "why": "flag present verbatim in the triage report",
+            "next_steps": [], "commands": [],
+        }
+    ns, cmds = [], []
+    if re.search(r"run with -c|re-run.*-c|PASSWORD GUESSING", report):
+        ns.append("Re-run cracking tiers: ctf-file <file> -d hard -c")
+        cmds.append("ctf-file <file> -d hard -c")
+    if not ns:
+        ns.append("Inspect the triage report manually; nothing auto-decoded.")
+    return {
+        "verdict": "NEEDS_MORE_WORK", "flag": None, "flag_verified": False,
+        "confidence": "LOW", "why": f"no flag auto-found ({reason})",
+        "next_steps": ns, "commands": cmds,
+    }
+
+
+def eval_or_fallback(answer, report, rflags, artifact_text, used_model, reason_label):
+    """Parse the model reply into a verdict; if NOTHING parseable came back
+    (e.g. the model looped or its answer was truncated by max_tokens), degrade to
+    the deterministic heuristic instead of emitting a bare empty INCONCLUSIVE.
+    Returns (ev, used_model)."""
+    fields = parse_schema(answer)
+    if not any(v.strip() for v in fields.values()):
+        eprint(f"[ctf-eval] {used_model} returned no parseable verdict "
+               f"(truncated or looped) — falling back to offline heuristic")
+        return heuristic_eval(report, rflags, f"{reason_label}: unparseable reply"), \
+               f"{used_model}+heuristic"
+    return build_eval(fields, report, rflags, artifact_text), used_model
+
+
+def build_eval(fields, report, rflags, artifact_text=""):
+    verdict = norm_none(fields["VERDICT"]).upper() or "INCONCLUSIVE"
+    flag = norm_none(fields["FLAG"]) or None
+    conf = norm_none(fields["CONFIDENCE"]).upper() or "LOW"
+    why = norm_none(fields["WHY"])
+    steps = as_list(fields["NEXT_STEPS"])
+    cmds = as_list(fields["COMMANDS"])
+
+    # F8: a claimed flag must appear verbatim in the ground truth, else it is hallucinated.
+    # Ground truth is the stdout report PLUS the inlined artifact contents PLUS the tokens
+    # scanned out of every text artifact (rflags) — a flag in an extracted file is legit.
+    corpus = report + "\n" + artifact_text
+    flag_verified = bool(flag and (flag in corpus or flag in rflags))
+    if flag and not flag_verified:
+        why = (why + " " if why else "") + \
+              f"[ctf-eval: claimed flag '{flag}' NOT found in report — treating as unverified]"
+        flag = None
+        if verdict == "SOLVED":
+            verdict = "NEEDS_MORE_WORK"      # hallucination guard
+        conf = "LOW"
+
+    # F4: if the model claims SOLVED but named no flag and none is in the report, abstain.
+    if verdict == "SOLVED" and not flag and not rflags:
+        verdict = "NEEDS_MORE_WORK"
+        why = (why + " " if why else "") + "[ctf-eval: SOLVED without a flag — abstaining]"
+
+    # Ground truth wins: report has a flag the model missed.
+    if not flag and rflags:
+        flag = rflags[0]; flag_verified = True
+        if verdict != "SOLVED":
+            verdict = "SOLVED"; conf = "HIGH"
+            why = (why + " " if why else "") + "[ctf-eval: flag found in report]"
+
+    return {
+        "verdict": verdict, "flag": flag, "flag_verified": flag_verified,
+        "confidence": conf, "why": why, "next_steps": steps, "commands": cmds,
+    }
+
+
+# ---------------------------------------------------------------- output
+def print_summary(ev, model):
+    C = sys.stdout.isatty()
+    def c(code, s): return f"\033[{code}m{s}\033[0m" if C else s
+    v = ev["verdict"]
+    vcol = "32" if v == "SOLVED" else ("33" if v == "NEEDS_MORE_WORK" else "36")
+    print(c("36;1", "=== EVAL ===") if C else "=== EVAL ===")
+    print(f"  model      : {model}")
+    print(f"  verdict    : {c(vcol+';1', v)}")
+    if ev["flag"]:
+        tag = "verified" if ev["flag_verified"] else "UNVERIFIED"
+        print(f"  flag       : {c('32;1', ev['flag'])} ({tag})")
+    else:
+        print(f"  flag       : {c('90', 'none')}")
+    print(f"  confidence : {ev['confidence']}")
+    if ev["why"]:
+        print(f"  why        : {ev['why']}")
+    if ev["next_steps"]:
+        print("  next steps :")
+        for s in ev["next_steps"]:
+            print(f"    - {s}")
+    if ev["commands"]:
+        print("  commands   :")
+        for s in ev["commands"]:
+            print(f"    $ {s}")
+
+
+def write_json(path, ev, model, base, report_file, trace_file, rflags,
+               manifest=None, artifact_flags=None):
+    doc = {
+        "version": VERSION, "tool": "ctf-eval", "timestamp": now_iso(),
+        "file": base, "model": model,
+        "verdict": ev["verdict"], "flag": ev["flag"],
+        "flag_verified": ev["flag_verified"], "confidence": ev["confidence"],
+        "why": ev["why"], "next_steps": ev["next_steps"], "commands": ev["commands"],
+        "report_flags": rflags, "artifact_flags": artifact_flags or [],
+        "artifacts": manifest or [],
+        "report_file": report_file, "trace_file": trace_file,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+    return doc
+
+
+# ---------------------------------------------------------------- main
+def parse_args(argv):
+    if "--" in argv:
+        i = argv.index("--")
+        left, passthrough = argv[:i], argv[i + 1:]
+    else:
+        left, passthrough = argv, []
+    model = DEEPSEEK
+    offline = False
+    local = False        # True → force a local model (--local, --fast, or --model)
+    target = None
+    i = 0
+    while i < len(left):
+        a = left[i]
+        if a in ("-h", "--help"):
+            print(__doc__); sys.exit(0)
+        elif a == "--fast":
+            model = QWEN; local = True
+        elif a == "--offline":
+            offline = True
+        elif a == "--local":
+            local = True
+        elif a == "--model":
+            i += 1; model = left[i]; local = True
+        elif a.startswith("--model="):
+            model = a.split("=", 1)[1]; local = True
+        elif a.startswith("-"):
+            eprint(f"[ctf-eval] unknown option {a} (pass ctf-file opts after `--`)"); sys.exit(1)
+        elif target is None:
+            target = a
+        else:
+            eprint(f"[ctf-eval] unexpected arg {a}"); sys.exit(1)
+        i += 1
+    return target, model, offline, local, passthrough
+
+
+def main():
+    target, model, offline, local, passthrough = parse_args(sys.argv[1:])
+    if not target:
+        eprint("usage: ctf-eval <file> [--fast|--model M|--offline] [-- ctf-file opts]"); sys.exit(1)
+    if not os.path.isfile(target):
+        eprint(f"[ctf-eval] not a file: {target}"); sys.exit(1)
+    ctf_file = resolve_ctf_file()
+    if not ctf_file:
+        eprint("[ctf-eval] ctf-file not on PATH or ~/bin"); sys.exit(1)
+
+    base = os.path.basename(target)
+    work = f"{base}-work"
+    os.makedirs(work, exist_ok=True)
+    report_path = os.path.join(work, "triage-report.txt")
+    trace_path  = os.path.join(work, "eval-trace.txt")
+    json_path   = os.path.join(work, "eval.json")
+
+    # Brain selection (known before triage): remote gateway is the default evaluator
+    # when a key is present and the user didn't pick a local model or --offline.
+    use_remote = REMOTE_ENABLED and bool(REMOTE_KEY) and not local and not offline
+    report_cap = REMOTE_REPORT_CAP if use_remote else REPORT_CAP
+    art_file_cap  = REMOTE_ARTIFACT_FILE_CAP  if use_remote else ARTIFACT_FILE_CAP
+    art_total_cap = REMOTE_ARTIFACT_TOTAL_CAP if use_remote else ARTIFACT_TOTAL_CAP
+
+    report = run_triage(ctf_file, target, passthrough, report_path)
+
+    # Read the artifact folder ctf-file left behind (extracted payloads, cracked archives,
+    # stego dumps, commands.log) — a flag can live in a file that never reached stdout.
+    manifest, artifact_text, artifact_flags = scan_artifacts(work, art_file_cap, art_total_cap)
+
+    # Ground truth = flags in the stdout report, then any extra flags found in the artifacts.
+    rflags = report_flags(report)
+    for fl in artifact_flags:
+        if fl not in rflags:
+            rflags.append(fl)
+
+    n_art = len([m for m in manifest if m["kind"] != "unreadable"])
+    eprint(f"[ctf-eval] report saved to {report_path} — {n_art} artifact file(s)"
+           + (f", {len(rflags)} flag(s) already present" if rflags else ""))
+
+    trace_file = None
+    used_model = model
+
+    # Build the eval prompt once (shared by remote + local paths).
+    capped = report[:report_cap]
+    art_list = "\n".join(f"  {m['path']}  ({m['size']} B, {m['kind']})"
+                         for m in manifest) or "  (none)"
+    prompt = (f"Triage report for file '{base}':\n\n--- BEGIN REPORT ---\n"
+              f"{capped}\n--- END REPORT ---\n\n"
+              f"Files ctf-file extracted into {work}/:\n{art_list}")
+    if artifact_text:
+        prompt += ("\n\n--- BEGIN ARTIFACT CONTENTS ---\n"
+                   f"{artifact_text}\n--- END ARTIFACT CONTENTS ---")
+
+    if offline:
+        eprint("[ctf-eval] offline eval (requested)")
+        ev = heuristic_eval(report, rflags, "requested")
+        used_model = "offline-heuristic"
+    elif use_remote:
+        eprint(f"[ctf-eval] asking remote brain {REMOTE_MODEL} ({REMOTE_BASE}) ...")
+        raw = None
+        try:
+            content, reasoning = remote_chat(SYSTEM, prompt, echo=sys.stderr.isatty())
+            raw = True; used_model = REMOTE_MODEL
+        except Exception as e:
+            eprint(f"[ctf-eval] remote brain failed ({e}) — falling back to offline heuristic")
+            ev = heuristic_eval(report, rflags, f"remote error: {e}")
+            used_model = "offline-heuristic"
+        if raw is not None:
+            answer, _ = split_think(content)
+            with open(trace_path, "w", encoding="utf-8", errors="replace") as f:
+                if reasoning.strip():
+                    f.write("=== REASONING (model thinking) ===\n" + reasoning.strip() + "\n\n")
+                f.write("=== ANSWER (parsed for verdict) ===\n" + content.strip() + "\n")
+            trace_file = os.path.basename(trace_path)
+            ev, used_model = eval_or_fallback(answer, report, rflags, artifact_text,
+                                              used_model, "remote")
+    elif not server_up():
+        eprint(f"[ctf-eval] offline eval ({MAC_IP}:11434 unreachable)")
+        ev = heuristic_eval(report, rflags, f"{MAC_IP}:11434 unreachable")
+        used_model = "offline-heuristic"
+    else:
+        echo = sys.stderr.isatty()
+        eprint(f"[ctf-eval] asking {model} (keep_alive={KEEPALIVE}) ...")
+        raw = None
+        try:
+            content, reasoning = stream_chat(model, SYSTEM, prompt, echo)
+            raw = True
+        except Exception as e:
+            eprint(f"[ctf-eval] model call failed ({e}) — falling back to offline heuristic")
+            ev = heuristic_eval(report, rflags, f"model error: {e}")
+            used_model = "offline-heuristic"
+        if raw is not None:
+            answer, _ = split_think(content)     # also handle models that inline <think> in content
+            # D5 (resolved 2026-07-22): no dolphin refusal-fallback on the EVAL path. Forensics-report
+            # evaluation never triggers a refusal, and dolphin-8b grading a report would be lower
+            # quality than honestly surfacing INCONCLUSIVE. Dolphin stays only on the offensive/ReAct
+            # path (ctf-toolchain). A refusal here just flows through as the model's answer.
+            with open(trace_path, "w", encoding="utf-8", errors="replace") as f:
+                if reasoning.strip():
+                    f.write("=== REASONING (model thinking) ===\n" + reasoning.strip() + "\n\n")
+                f.write("=== ANSWER (parsed for verdict) ===\n" + content.strip() + "\n")
+            trace_file = os.path.basename(trace_path)
+            ev, used_model = eval_or_fallback(answer, report, rflags, artifact_text,
+                                              used_model, "local model")
+
+    print_summary(ev, used_model)
+    write_json(json_path, ev, used_model, base, os.path.basename(report_path),
+               trace_file, rflags, manifest, artifact_flags)
+    eprint(f"[ctf-eval] structured verdict -> {json_path}")
+    # exit code communicates verdict: 0 solved, 3 needs work, 4 inconclusive
+    sys.exit(0 if ev["verdict"] == "SOLVED" else (3 if ev["verdict"] == "NEEDS_MORE_WORK" else 4))
+
+
+if __name__ == "__main__":
+    main()

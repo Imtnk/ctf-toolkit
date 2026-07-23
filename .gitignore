@@ -1,4 +1,17 @@
-# ctf-file writes everything it extracts into ./<file>-work/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Agent run transcripts (may contain challenge data)
+.agent/
+
+# Secrets — the real key lives in ~/.config/ctf-toolchain/secrets.env (outside the repo);
+# these are belt-and-suspenders so a stray copy never gets committed.
+secrets.env
+*.key
+.env
+secrets.env
+*.key
+.env
 *-work/
-# decompressed wordlist cache
-wordlists/
+examples/*-work/

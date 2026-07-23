@@ -1,4 +1,14 @@
-# These are Linux shell scripts — always check out with LF, never CRLF,
-# so they run on Kali even when cloned on Windows.
-ctf-file  text eol=lf
-*.sh      text eol=lf
+* text=auto
+
+# Linux scripts must ALWAYS be LF so they run on Kali even when cloned on Windows.
+*.sh       text eol=lf
+*.py       text eol=lf
+ctf-file   text eol=lf
+ctf-eval   text eol=lf
+install.sh text eol=lf
+
+# Binary assets — never apply EOL conversion.
+*.zip binary
+*.png binary
+*.bin binary
+*.pdf binary
