@@ -36,16 +36,24 @@ note if absent) are installed for you by `install.sh`:
 |------|----------------|----------|
 | `file`, `xxd`, `strings` | `file`, `xxd`, `binutils` | identify / magic bytes / strings |
 | `exiftool` | `libimage-exiftool-perl` | metadata |
-| `binwalk` | `binwalk` | carving / embedded files |
+| `binwalk`, `foremost` | `binwalk`, `foremost` | carving / embedded files (foremost = fallback) |
 | `unzip` | `unzip` | zip extraction |
 | `john` (+ `zip2john`, `rar2john`, `pdf2john.pl`, `office2john.py`) | `john` | archive password cracking |
-| `steghide`, `stegseek` | `steghide`, `stegseek` | JPEG/BMP/WAV stego + passphrase cracking |
+| `steghide`, `stegseek`, `outguess` | `steghide`, `stegseek`, `outguess` | JPEG/BMP/WAV stego + passphrase cracking |
 | `zsteg` | `gem install zsteg` (needs `ruby`) | PNG/BMP LSB stego |
 | `pngcheck` | `pngcheck` | PNG structure |
+| `tshark`, `tcpflow`, `capinfos` | `tshark`, `tcpflow` | **pcap**: objects, creds, stream reassembly |
+| `pdfinfo`/`pdfimages`/`pdfdetach` | `poppler-utils` | **pdf**: embedded images + attachments |
+| `olevba` | `python3-oletools` | **office**: VBA macro dump |
+| `zbarimg` | `zbar-tools` | **QR / barcode** decoding |
+| `sox` | `sox` | **audio**: spectrogram render |
+| `mmls`/`fls`/`icat`, `testdisk` | `sleuthkit`, `testdisk` | **disk images** (`--heavy`) |
+| `vol` (Volatility3) | `pipx install volatility3` | **memory dumps** (`--heavy`) |
 | rockyou wordlist | `wordlists` | medium/hard cracking tiers |
 
 > **Base Kali note:** a minimal (`kali-linux-core`) install does **not** ship most of
-> these. Run `install.sh` (below) — it installs everything via `apt` + one `gem`.
+> these. Run `install.sh` (below) — it installs everything via `apt`, one `gem`, and
+> `pipx` (Volatility3). Missing tools are always skipped gracefully, never fatal.
 
 ---
 
@@ -104,7 +112,8 @@ ctf-file -h                    # full man-page style manual
 |--------|---------|
 | `-d easy\|medium\|hard` | Force the cracking effort and skip the interactive prompts. **easy** = built-in common list only (instant); **medium** = common list then rockyou; **hard** = common list then rockyou + john mangling rules. |
 | `-c` | Non-interactive escalation: run the wordlist tier automatically (pairs with `-d`). |
-| `-n` | Don't auto-extract embedded files (skip `binwalk -e` and zip extraction). |
+| `-n` | Don't auto-extract embedded files (skip `binwalk -e`, zip, pcap-object, and pdf extraction). |
+| `-H`, `--heavy` | Enable the slow **DEEP ANALYSIS** pass on disk images (Sleuth Kit) and memory dumps (Volatility3). Off by default — without it those are only detected and suggested commands are printed. |
 | `-v`, `--verbose` | Echo every underlying tool command as it runs. |
 | `-w <path>` | Use this wordlist instead of rockyou for medium/hard. |
 | `-h`, `--help` | Show the full manual. |
@@ -143,10 +152,12 @@ printf 'ctf\n' > ~/.config/ctf-file/format      # this event uses ctf{...}
 | **IDENTIFY** | `file`, `stat`, `xxd` | real type + magic bytes (ignores the extension) |
 | **STRINGS** | `strings` (ASCII + UTF-16LE) | greps for `flag{`/`synt{`/`ctf{`/`key{` |
 | **METADATA** | `exiftool` | EXIF / doc properties (filesystem noise filtered) |
-| **CARVING** | `binwalk`, `unzip` | lists + auto-extracts embedded files; greps carved data |
-| **STEGANOGRAPHY** | `pngcheck`, `zsteg`, `steghide` | **only runs on images/audio** |
-| **PASSWORD GUESSING** | `*2john` + `john`, `steghide`, `stegseek` | common list first, then escalate |
+| **CARVING** | `binwalk`, `foremost`, `unzip`, `poppler-utils` | auto-extracts embedded files (foremost fallback); pulls **pdf** images/attachments; greps carved data |
+| **NETWORK** | `tshark`, `tcpflow`, `capinfos` | **pcap only**: protocol hierarchy, HTTP requests/objects, cleartext creds, TCP-stream reassembly → flag-grep |
+| **STEGANOGRAPHY** | `pngcheck`, `zsteg`, `steghide`, `outguess`, `zbarimg`, `sox` | **images/audio only**: LSB, passphrase, QR/barcode, audio spectrogram |
+| **PASSWORD GUESSING** | `*2john` + `john`, `steghide`, `stegseek`, `olevba` | common list first, then escalate; **office** macro dump |
 | **AUTO-DECODE** | `tr`, `base64` | ROT13 / base64 on flag-like strings |
+| **DEEP ANALYSIS** (`--heavy`) | `mmls`/`fls`/`icat`, `vol` | **disk images**: partition table + filesystem walk; **memory dumps**: Volatility3 |
 | **SUMMARY** | — | every finding collected in one list |
 
 Password guessing always tries a cheap built-in **common list first** (empty, `password`,

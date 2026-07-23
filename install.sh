@@ -17,7 +17,11 @@ else
 fi
 
 echo "==> Installing apt packages (needs sudo) ..."
-APT_PKGS="file binutils xxd binwalk libimage-exiftool-perl unzip john steghide stegseek pngcheck ruby wordlists"
+# core triage + stego + carving + archive cracking
+APT_CORE="file binutils xxd binwalk libimage-exiftool-perl unzip john steghide stegseek pngcheck outguess ruby wordlists"
+# network (pcap), documents, QR, audio, disk/memory forensics
+APT_FORENSICS="tshark tcpflow poppler-utils zbar-tools sleuthkit foremost testdisk sox python3-oletools"
+APT_PKGS="$APT_CORE $APT_FORENSICS"
 if command -v apt-get >/dev/null 2>&1; then
   sudo apt-get update -y
   # install what's available; don't abort the whole run if one package name differs
@@ -33,6 +37,14 @@ if command -v gem >/dev/null 2>&1; then
   sudo gem install zsteg || echo "   (zsteg install failed — PNG LSB stego will be skipped)"
 else
   echo "   ruby/gem not present — skipping zsteg (install 'ruby' then 'gem install zsteg')"
+fi
+
+echo "==> Installing Volatility3 for the --heavy memory-dump path (pipx) ..."
+if command -v pipx >/dev/null 2>&1; then
+  pipx install volatility3 || echo "   (volatility3 install failed — memory analysis will be skipped)"
+  pipx ensurepath >/dev/null 2>&1 || true
+else
+  echo "   pipx not present — run 'sudo apt-get install -y pipx' then 'pipx install volatility3' for memory support"
 fi
 
 # ---- install the script ---------------------------------------------------

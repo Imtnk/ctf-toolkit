@@ -7,7 +7,7 @@ NAME
     ctf-file — automated first-pass forensics triage for a single file.
 
 SYNOPSIS
-    ctf-file <file> [-d easy|medium|hard] [-c] [-n] [-v] [-w wordlist] [-h]
+    ctf-file <file> [-d easy|medium|hard] [-c] [-n] [-H] [-v] [-w wordlist] [-h]
 
 DESCRIPTION
     Runs the standard forensics recon reflex on ONE file and prints a colour-coded,
@@ -16,6 +16,12 @@ DESCRIPTION
     Missing tools are skipped (never fatal). Colour, the progress bar and the spinner
     appear only on an interactive terminal — piping the output (e.g. into ctf-eval /
     ai.py / a file) yields clean plain text.
+
+    It branches on the real file type (from `file`, not the extension): captures get a
+    NETWORK pass (tshark/tcpflow), PDFs/Office docs get object + macro extraction, images
+    get QR/stego, audio gets a spectrogram. Disk images and memory dumps are detected and,
+    with -H/--heavy, walked with Sleuth Kit / Volatility3 (slow — off by default so the
+    fast path stays safe to pipe into ctf-eval).
 
 FLAG FORMAT
     The prefix(es) hunted for (the part before "{") come from, in priority order:
@@ -35,14 +41,26 @@ OPTIONS
     -c           Non-interactive escalation: run the wordlist tier automatically
                  (pairs with -d; implied "yes" to escalation when not at a terminal).
     -n           Do not auto-extract embedded files (skip binwalk -e and zip extraction).
+    -H, --heavy  Enable the slow DEEP ANALYSIS pass on disk images (Sleuth Kit: mmls/fls/
+                 icat) and memory dumps (Volatility3). OFF by default — without it, a disk
+                 image or memory dump is only detected and suggested commands are printed.
     -v, --verbose  Echo every underlying tool command as it runs. The full command list
                  is ALSO always saved to ./<file>-work/commands.log (with or without -v).
     -w <path>    Use this wordlist instead of rockyou.txt for medium/hard.
     -h, --help   Show this manual.
 
 SECTIONS (in order)
-    IDENTIFY · STRINGS · METADATA · CARVING · STEGANOGRAPHY · PASSWORD GUESSING ·
-    AUTO-DECODE · SUMMARY · DONE
+    IDENTIFY · STRINGS · METADATA · CARVING · NETWORK · STEGANOGRAPHY ·
+    PASSWORD GUESSING · AUTO-DECODE · DEEP ANALYSIS · SUMMARY · DONE
+
+    Type-specific extras fire only for the matching file type:
+      pcap/pcapng  -> NETWORK: capinfos, protocol hierarchy, HTTP objects, creds, stream
+                      reassembly (tshark/tcpflow), flag-grep across reassembled data.
+      pdf          -> CARVING: pdfinfo + pdfimages + pdfdetach (embedded objects/attachments).
+      office doc   -> PASSWORD GUESSING: olevba macro dump (+ existing hash cracking).
+      image        -> STEGANOGRAPHY: zbarimg (QR/barcode) + zsteg/pngcheck + steghide/outguess.
+      audio        -> STEGANOGRAPHY: sox spectrogram image written for manual inspection.
+      disk / mem   -> DEEP ANALYSIS (with -H): Sleuth Kit (mmls/fls/icat) / Volatility3.
 
 PASSWORD GUESSING
     The cheap built-in common-password list is ALWAYS tried first, at every tier, for
@@ -60,6 +78,9 @@ EXAMPLES
     ctf-file locked.zip                  # common list cracks it instantly if it's weak
     ctf-file photo.jpg -d hard           # non-interactive, escalate straight to rockyou+rules
     ctf-file dump.raw -n                 # skip extraction (big image)
+    ctf-file capture.pcap                # NETWORK pass: objects, creds, reassembled streams
+    ctf-file disk.img --heavy            # walk partitions/filesystem with Sleuth Kit
+    ctf-file mem.raw --heavy             # Volatility3 windows.info / pslist / filescan
     ctf-file chall.png | ctf-eval        # plain-text report piped onward (no colour/prompts)
 
 SEE ALSO
@@ -68,12 +89,13 @@ MAN
 }
 
 # ---- args ----------------------------------------------------------------
-DIFF="medium"; EXPLICIT_DIFF=0; DO_CRACK=0; NO_EXTRACT=0; WORDLIST_OVERRIDE=""; VERBOSE=0; F=""
+DIFF="medium"; EXPLICIT_DIFF=0; DO_CRACK=0; NO_EXTRACT=0; WORDLIST_OVERRIDE=""; VERBOSE=0; HEAVY=0; F=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -d) shift; DIFF="${1:-medium}"; EXPLICIT_DIFF=1 ;;
     -c) DO_CRACK=1 ;;
     -n) NO_EXTRACT=1 ;;
+    -H|--heavy) HEAVY=1 ;;
     -v|--verbose) VERBOSE=1 ;;
     -w) shift; WORDLIST_OVERRIDE="${1:-}" ;;
     -h|--help) usage; exit 0 ;;
@@ -81,7 +103,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-[ -z "$F" ] && { echo "usage: ctf-file <file> [-d easy|medium|hard] [-c] [-n] [-v] [-w wordlist] [-h]"; exit 1; }
+[ -z "$F" ] && { echo "usage: ctf-file <file> [-d easy|medium|hard] [-c] [-n] [-H] [-v] [-w wordlist] [-h]"; exit 1; }
 [ -f "$F" ] || { echo "not a file: $F"; exit 1; }
 case "$F" in -*) F="./$F";; esac         # H2: never let a filename be parsed as a tool option
 case "$DIFF" in easy|medium|hard) ;; *) echo "unknown difficulty '$DIFF' — using medium"; DIFF=medium ;; esac
@@ -124,7 +146,7 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
 else C_H=''; C_G=''; C_Y=''; C_R=''; C_M=''; C_D=''; C_B=''; C_0=''; fi
 
 # progress bar + spinner: stderr, interactive-only
-PROG=0; STEP=0; TOTAL=9; [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && PROG=1
+PROG=0; STEP=0; TOTAL=11; [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && PROG=1
 # prompts: only when BOTH stdout and stdin are terminals (so ctf-eval's pipe never prompts)
 INTERACTIVE=0; [ -t 1 ] && [ -t 0 ] && INTERACTIVE=1
 
@@ -152,6 +174,10 @@ resolve_helper(){ local c; for c in "$@"; do have "$c" && { echo "$c"; return; }
 FINDINGS=()
 POT=""                                       # per-run john pot (set in crack_archive)
 record(){ FINDINGS+=("$1"); }
+# scrub attacker-controlled decoded text (QR payloads, packet fields) before printing:
+# drop control bytes incl. ESC (so no ANSI injection / CR corruption in a piped report),
+# flatten newlines, and cap length — keeps the report clean plain text for ctf-eval.
+scrub(){ printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037\177' | tr '\r\n' '  ' | cut -c1-200; }
 CMDS=""                                       # command log (-v shows it live; always saved)
 logcmd(){ CMDS+="$1"$'\n'; [ "$VERBOSE" = 1 ] && printf '%s  $ %s%s\n' "$C_D" "$1" "$C_0"; }
 gotflag(){ hit "$1"; record "$2"; }                        # green + add to SUMMARY
@@ -228,6 +254,13 @@ if have binwalk; then
     if [ -n "$found" ]; then note "extracted:"; printf '%s\n' "$found" | sed 's/^/    /'
       ctok="$(flagtok_in "$OUT")"
       [ -n "$ctok" ] && gotflag "flag in carved data: $ctok" "CARVING: $ctok"
+    elif have foremost; then                      # binwalk found nothing — try signature carving
+      note "binwalk carved nothing — trying foremost ..."; logcmd "foremost -o \"$OUT/foremost\" \"$F\""
+      spin "foremost carving" bash -c 'foremost -o "$1" "$2" >/dev/null 2>&1' _ "$OUT/foremost" "$F"
+      ff="$(find "$OUT/foremost" -mindepth 1 -type f ! -name audit.txt 2>/dev/null)"
+      if [ -n "$ff" ]; then note "foremost extracted ($(printf '%s\n' "$ff" | wc -l) file(s), first 40):"; printf '%s\n' "$ff" | head -40 | sed 's/^/    /'
+        ftok="$(flagtok_in "$OUT/foremost")"; [ -n "$ftok" ] && gotflag "flag in foremost data: $ftok" "FOREMOST: $ftok"
+      else dim "nothing carved (binwalk + foremost)"; fi
     else dim "nothing carved"; fi
   else warn "-n given — skipping auto-extraction"; fi
 else skip binwalk; fi
@@ -242,6 +275,68 @@ if [ "$NO_EXTRACT" = 0 ] && have unzip && unzip -l "$F" >/dev/null 2>&1; then
     warn "ZIP is encrypted / needs a password — see PASSWORD GUESSING below"
   fi
 fi
+# PDF: pull embedded images + attachments (TCTT hides objects/streams inside PDFs)
+case "$TYPE" in *PDF*)
+  if have pdfinfo || have pdfimages || have pdfdetach; then
+    mkout; echo "  -- pdf objects:"
+    if have pdfinfo; then logcmd "pdfinfo \"$F\""
+      pmeta="$(pdfinfo "$F" 2>/dev/null)"; printf '%s\n' "$pmeta" | sed 's/^/  /'
+      pm="$(printf '%s\n' "$pmeta" | grep -aEi "$FLAGRE")"; [ -n "$pm" ] && gotflag "pdf metadata: $pm" "PDF META: $pm"
+    fi
+    if [ "$NO_EXTRACT" = 0 ]; then                 # honour -n like the other extractors
+      mkdir -p "$OUT/pdf"; PDF_ABS="$(cd "$(dirname "$F")" && pwd)/$(basename "$F")"
+      have pdfimages && { logcmd "pdfimages -all \"$F\" \"$OUT/pdf/img\""; pdfimages -all "$F" "$OUT/pdf/img" >/dev/null 2>&1; }
+      # pdfdetach -saveall writes to the CWD using embedded names (its -o only applies to
+      # -save <n>), so run it from inside $OUT/pdf with an absolute source path.
+      have pdfdetach && { logcmd "(cd \"$OUT/pdf\" && pdfdetach -saveall \"$PDF_ABS\")"; ( cd "$OUT/pdf" && pdfdetach -saveall "$PDF_ABS" >/dev/null 2>&1 ); }
+      pf="$(find "$OUT/pdf" -mindepth 1 -type f 2>/dev/null)"
+      if [ -n "$pf" ]; then note "pdf embedded files (first 20):"; printf '%s\n' "$pf" | head -20 | sed 's/^/    /'
+        ptok="$(flagtok_in "$OUT/pdf")"; [ -n "$ptok" ] && gotflag "flag in pdf object: $ptok" "PDF OBJECT: $ptok"
+      else dim "no embedded images/attachments in the pdf"; fi
+    else warn "-n given — skipping pdf object extraction"; fi
+  fi ;;
+esac
+
+# ---- 4b. network / packet captures ---------------------------------------
+sec "NETWORK (pcap / capture)"
+case "$TYPE" in
+  *pcap*|*pcapng*|*tcpdump*|*"capture file"*)
+    if have tshark || have tcpflow || have capinfos; then
+      mkout; cred=""; ho=""; ntok=""       # init (set -u safe when a tool is absent)
+      if have capinfos; then logcmd "capinfos \"$F\""
+        capinfos "$F" 2>/dev/null | grep -aiE 'Number of packets|File encapsulation|Capture duration|First packet|Last packet' | sed 's/^/  /'
+      fi
+      if have tshark; then
+        echo "  -- protocol hierarchy:"; logcmd "tshark -q -z io,phs -r \"$F\""
+        tshark -q -z io,phs -r "$F" 2>/dev/null | sed -n '1,30p' | sed 's/^/  /'
+        echo "  -- HTTP requests:"; logcmd "tshark -r \"$F\" -Y http.request -T fields -e http.host -e http.request.uri"
+        tshark -r "$F" -Y http.request -T fields -e http.host -e http.request.uri 2>/dev/null | grep -av '^[[:space:]]*$' | head -15 | sed 's/^/    /'
+        # cleartext credentials (HTTP basic / FTP / Telnet)
+        logcmd "tshark -r \"$F\" -Y 'http.authbasic || ftp.request.command==USER/PASS' -T fields -e http.authbasic -e ftp.request.arg"
+        cred="$(tshark -r "$F" -Y 'http.authbasic || ftp.request.command=="USER" || ftp.request.command=="PASS"' \
+                  -T fields -e http.authbasic -e ftp.request.arg 2>/dev/null | grep -av '^[[:space:]]*$' | sort -u)"
+        [ -n "$cred" ] && { warn "credentials seen in traffic:"; printf '%s\n' "$cred" | head -10 | while IFS= read -r cl; do printf '    %s\n' "$(scrub "$cl")"; done; record "NETWORK creds: $(scrub "$(printf '%s' "$cred" | head -1)")"; }
+        # carve HTTP objects (files transferred over HTTP) — writes files, so honour -n
+        if [ "$NO_EXTRACT" = 0 ]; then
+          logcmd "tshark -r \"$F\" --export-objects http,\"$OUT/http-objects\""
+          mkdir -p "$OUT/http-objects"; tshark -r "$F" --export-objects http,"$OUT/http-objects" >/dev/null 2>&1
+          ho="$(find "$OUT/http-objects" -mindepth 1 -type f 2>/dev/null)"
+          [ -n "$ho" ] && { note "HTTP objects extracted -> $OUT/http-objects/"; printf '%s\n' "$ho" | head -10 | sed 's/^/    /'; }
+        fi
+      fi
+      if [ "$NO_EXTRACT" = 0 ] && have tcpflow; then   # reassemble every TCP stream, then flag-grep
+        logcmd "tcpflow -r \"$F\" -o \"$OUT/tcpflow\""
+        mkdir -p "$OUT/tcpflow"; tcpflow -r "$F" -o "$OUT/tcpflow" >/dev/null 2>&1
+      fi
+      if [ "$NO_EXTRACT" = 0 ]; then                   # flagtok_in already returns a single token
+        ntok="$( { flagtok_in "$OUT/http-objects"; flagtok_in "$OUT/tcpflow"; } 2>/dev/null | head -1)"
+        [ -n "$ntok" ] && gotflag "flag in reassembled traffic: $ntok" "NETWORK: $ntok"
+      else warn "-n given — skipping HTTP-object / stream extraction"; fi
+      [ -z "$ntok$cred$ho" ] && dim "no flag/creds in HTTP objects or reassembled streams (try Wireshark: Follow > TCP Stream)"
+    else skip "tshark/tcpflow (wireshark-common)"; fi
+    ;;
+  *) dim "not a packet capture — network checks skipped" ;;
+esac
 
 # ---- 5. steganography (images / audio only) ------------------------------
 sec "STEGANOGRAPHY"
@@ -264,6 +359,34 @@ case "$TYPE" in
         hit "steghide extracted with EMPTY passphrase -> $OUT/steghide_empty.out"
         etok="$(grep -aoiE "$FLAGTOK" "$OUT/steghide_empty.out" 2>/dev/null | head -1)"; [ -n "$etok" ] && record "STEGHIDE(empty): $etok"
       else dim "no payload with empty passphrase"; fi
+    fi
+    # QR / barcode (any image) — TCTT misc/forensics loves an embedded QR
+    if [[ "$TYPE" == *PNG* || "$TYPE" == *JPEG* || "$TYPE" == *GIF* || "$TYPE" == *bitmap* ]] && have zbarimg; then
+      echo "  -- zbarimg (QR/barcode):"; logcmd "zbarimg -q --raw \"$F\""
+      q="$(zbarimg -q --raw "$F" 2>/dev/null)"
+      if [ -n "$q" ]; then note "decoded: $(scrub "$q")"
+        qtok="$(printf '%s\n' "$q" | grep -aoiE "$FLAGTOK" | head -1)"
+        if [ -n "$qtok" ]; then gotflag "QR: $qtok" "QR/BARCODE: $qtok"
+        else record "QR/BARCODE decoded: $(scrub "$q")"; fi
+      else dim "no QR/barcode detected"; fi
+    fi
+    # outguess (JPEG) — try the empty key after steghide
+    if [[ "$TYPE" == *JPEG* ]] && have outguess; then
+      echo "  -- outguess (empty key):"; mkout; rm -f "$OUT/outguess.out"
+      logcmd "outguess -r \"$F\" \"$OUT/outguess.out\""
+      if outguess -r "$F" "$OUT/outguess.out" >/dev/null 2>&1 && [ -s "$OUT/outguess.out" ]; then
+        otok="$(grep -aoiE "$FLAGTOK" "$OUT/outguess.out" 2>/dev/null | head -1)"
+        if [ -n "$otok" ]; then gotflag "outguess: $otok" "OUTGUESS: $otok"; else note "outguess wrote $OUT/outguess.out (no flag token — inspect it)"; fi
+      else dim "outguess: nothing extracted with empty key"; fi
+    fi
+    # audio spectrogram — flags are often drawn into the frequency domain
+    if [[ "$TYPE" == *WAVE* || "$TYPE" == *"Audio file"* ]] && have sox; then
+      echo "  -- sox spectrogram:"; mkout
+      logcmd "sox \"$F\" -n spectrogram -o \"$OUT/spectrogram.png\""
+      if sox "$F" -n spectrogram -o "$OUT/spectrogram.png" >/dev/null 2>&1; then
+        hit "spectrogram written -> $OUT/spectrogram.png (open it — flags are often hidden in the spectrum)"
+        record "AUDIO: inspect spectrogram $OUT/spectrogram.png"
+      else dim "sox could not render a spectrogram"; fi
     fi
     ;;
   *) dim "not an image/audio file — steganography checks skipped" ;;
@@ -375,7 +498,13 @@ case "$TYPE" in
   *Zip*)                  echo "  -- zip:";    crack_archive "$(resolve_helper zip2john)"    zip ;;
   *RAR*)                  echo "  -- rar:";    crack_archive "$(resolve_helper rar2john)"    rar ;;
   *PDF*)                  echo "  -- pdf:";    crack_archive "$(resolve_helper pdf2john pdf2john.pl)" pdf ;;
-  *Microsoft*|*"Composite Document"*|*OpenXML*) echo "  -- office:"; crack_archive "$(resolve_helper office2john office2john.py)" office ;;
+  *Microsoft*|*"Composite Document"*|*OpenXML*)
+    if have olevba; then echo "  -- olevba (VBA macros):"; logcmd "olevba --no-hexdump \"$F\""
+      ov="$(olevba --no-hexdump "$F" 2>/dev/null)"
+      printf '%s\n' "$ov" | grep -aiE "AutoOpen|Auto_Open|Document_Open|Shell|WScript|powershell|$FLAGRE" | head -20 | sed 's/^/    /'
+      mtok="$(printf '%s\n' "$ov" | grep -aoiE "$FLAGTOK" | head -1)"; [ -n "$mtok" ] && gotflag "flag in macro: $mtok" "OFFICE MACRO: $mtok"
+    fi
+    echo "  -- office:"; crack_archive "$(resolve_helper office2john office2john.py)" office ;;
   # L3: steghide only supports JPEG/BMP/WAV/AU — don't run its passphrase loop on PNG/GIF.
   *JPEG*|*bitmap*|*"WAVE audio"*) echo "  -- steghide passphrase:"; crack_steghide ;;
   *) if [ "$IS_STEGO_MEDIA" = 1 ]; then dim "PNG/GIF — steghide N/A; LSB already tried in STEGANOGRAPHY"
@@ -398,6 +527,56 @@ if [ -n "$CAND" ]; then
 fi
 [ "$DEC_ANY" = 0 ] && dim "nothing decoded to a flag"
 
+# ---- 7b. deep analysis: disk images & memory dumps (slow — -H/--heavy) ----
+sec "DEEP ANALYSIS (disk / memory)"
+# Detect a disk image two ways: a partition table (mmls) OR a bare filesystem (fsstat).
+IS_DISK=0; DISK_OFF=""; DISK_KIND=""
+if have mmls && mmls "$F" >/dev/null 2>&1; then IS_DISK=1; DISK_KIND="partition table"
+  # First filesystem-bearing partition's start sector -> offset for fls/icat (-o).
+  # Drop container/metadata rows first (Extended, Unallocated, tables) — they hold no fs,
+  # and "Extended" must not be matched by an "Ext" substring. Also match GPT descriptions.
+  DISK_OFF="$(mmls "$F" 2>/dev/null \
+              | grep -aivE 'Unallocated|Extended|Primary Table|Partition Table|Meta|Safety' \
+              | awk '/NTFS|exFAT|FAT|Linux|HFS|APFS|Basic data|filesystem|0x83|0x07|0x0b|0x0c/{print $3; exit}')"
+elif have fsstat && fsstat "$F" >/dev/null 2>&1; then IS_DISK=1; DISK_KIND="bare filesystem"; fi
+if [ "$IS_DISK" = 1 ]; then
+  hit "looks like a DISK IMAGE ($DISK_KIND$([ -n "$DISK_OFF" ] && echo "; first fs @ sector $DISK_OFF"))"
+  have mmls && { logcmd "mmls \"$F\""; mmls "$F" 2>/dev/null | sed 's/^/  /'; }
+  if [ "$HEAVY" = 1 ] && have fls; then
+    mkout; OFFARG=""; [ -n "$DISK_OFF" ] && OFFARG="-o $DISK_OFF"
+    [ "$DISK_KIND" = "partition table" ] && [ -z "$DISK_OFF" ] && warn "could not auto-pick a filesystem partition — run:  mmls \"$F\"  then  fls -o <sector> \"$F\""
+    note "walking the filesystem (fls -r $OFFARG) ..."; logcmd "fls -r -p $OFFARG \"$F\" > \"$OUT/fls.txt\""
+    spin "walking filesystem" bash -c 'fls -r -p $3 "$1" > "$2/fls.txt" 2>/dev/null' _ "$F" "$OUT" "$OFFARG"
+    head -40 "$OUT/fls.txt" 2>/dev/null | sed 's/^/  /'
+    fhit="$(grep -aiE "$FLAGRE|secret|flag|password" "$OUT/fls.txt" 2>/dev/null | head -10)"
+    [ -n "$fhit" ] && { note "interesting paths:"; printf '%s\n' "$fhit" | sed 's/^/    /'; }
+    note "read a file:  icat $OFFARG \"$F\" <inode>   (inode = the number in the fls line, e.g. 'r/r 12:')"
+  elif [ "$HEAVY" = 1 ]; then warn "fls (sleuthkit) not installed — cannot walk the filesystem"
+  else warn "re-run with --heavy to walk the filesystem (mmls/fls/icat) — skipped (slow)"; fi
+# Raw memory dumps report as bare "data" (or name dump/crash/LiME); anchor ^data$ so we do
+# NOT match "PNG image data", "JPEG image data", "PC bitmap ... data", etc.
+elif printf '%s' "$TYPE" | grep -qiE '^data$|dump|crash|core|LiME|memory'; then
+  VOLBIN="$(resolve_helper vol vol.py volatility3)"      # pip/distro name varies
+  if [ "$HEAVY" = 1 ] && [ -n "$VOLBIN" ]; then
+    note "trying Volatility3 (memory image) ..."; logcmd "$VOLBIN -f \"$F\" windows.info"
+    vinfo="$(spin "volatility windows.info" bash -c '"$1" -f "$2" windows.info 2>/dev/null' _ "$VOLBIN" "$F"; :)"
+    if printf '%s' "$vinfo" | grep -qiE 'Kernel Base|NtBuildLab|Is64Bit|windows'; then
+      hit "Volatility parsed this as a Windows memory image"
+      printf '%s\n' "$vinfo" | head -20 | sed 's/^/  /'
+      for plug in windows.pslist windows.cmdline; do
+        echo "  -- $plug:"; logcmd "$VOLBIN -f \"$F\" $plug"
+        "$VOLBIN" -f "$F" $plug 2>/dev/null | head -15 | sed 's/^/  /'
+      done
+      logcmd "$VOLBIN -f \"$F\" windows.filescan | grep -iE 'flag|secret|\\.txt'"
+      fscan="$("$VOLBIN" -f "$F" windows.filescan 2>/dev/null | grep -aiE 'flag|secret|\.txt$' | head -15)"
+      [ -n "$fscan" ] && { note "interesting files in memory:"; printf '%s\n' "$fscan" | sed 's/^/  /'; }
+    else dim "not a recognizable Windows memory image (try: $VOLBIN -f \"$F\" linux.* / mac.*)"; fi
+  elif [ "$HEAVY" = 1 ]; then dim "volatility3 (vol/vol.py) not installed — cannot analyse memory"
+  else dim "generic data blob — if this is a memory dump, re-run with --heavy (Volatility3)"; fi
+else
+  dim "not a disk image or memory dump"
+fi
+
 # ---- 8. summary ----------------------------------------------------------
 sec "SUMMARY"
 if [ ${#FINDINGS[@]} -gt 0 ]; then
@@ -413,4 +592,4 @@ mkout; printf '%s' "$CMDS" > "$OUT/commands.log"     # full command log always s
 note "flag format: ${PREFIXES[*]}  (edit $FMT_FILE or set CTF_FLAG_FORMAT=)"
 [ -d "$OUT" ] && note "artifacts in: $OUT/  (command log: $OUT/commands.log)"
 [ "$VERBOSE" = 0 ] && note "re-run with -v to see every command as it runs"
-note "next: strings -n 6 \"$F\" | less   ·   Wireshark/Volatility for pcap/memory dumps"
+note "next: strings -n 6 \"$F\" | less   ·   Wireshark 'Follow Stream' for pcap   ·   --heavy for disk/memory (Sleuth Kit/Volatility)"
