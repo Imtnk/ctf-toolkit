@@ -81,6 +81,7 @@ def cmd_agent(args):
             max_steps=args.max_steps,
             auto_approve=(args.approve == "auto"),
             dry_run=args.dry_run,
+            cwd=os.getcwd(),
             resume_messages=resume_messages,
             verbose=args.verbose,
         )

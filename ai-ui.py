@@ -7,8 +7,9 @@ Usage:
   ai agent "<task>" ...    # agent passthrough (every ai.py flag works)
   ai -h                    # this help
 
-Thin wrapper around the sibling ai.py, always run from its own directory so the
-`agent` package imports. Bare `ai` opens a menu; any args pass straight through.
+Thin wrapper around the sibling ai.py. Runs in YOUR current directory so the agent
+operates on the files you're sitting in; ai.py's own dir is put on PYTHONPATH so the
+`agent` package still imports. Bare `ai` opens a menu; any args pass straight through.
 """
 import os, sys, signal, subprocess
 
@@ -41,11 +42,14 @@ def brain_line():
 
 
 def launch(args, shield_sigint=False):
-    """Run ai.py with args in its own dir. When shield_sigint, the parent ignores
-    Ctrl+C so it reaches the agent child (its own steer/abort handler), not us."""
+    """Run ai.py in the USER'S current directory so the agent's tools act on the
+    files you're in, not the repo. HERE goes on PYTHONPATH so the `agent` package
+    still imports. When shield_sigint, the parent ignores Ctrl+C so it reaches the
+    agent child's steer/abort handler, not us."""
     prev = signal.signal(signal.SIGINT, signal.SIG_IGN) if shield_sigint else None
+    env = {**os.environ, "PYTHONPATH": HERE + os.pathsep + os.environ.get("PYTHONPATH", "")}
     try:
-        subprocess.run([sys.executable, AI] + args, cwd=HERE)
+        subprocess.run([sys.executable, AI] + args, env=env)
     finally:
         if prev is not None:
             signal.signal(signal.SIGINT, prev)
