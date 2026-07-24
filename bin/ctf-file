@@ -275,6 +275,34 @@ if [ "$NO_EXTRACT" = 0 ] && have unzip && unzip -l "$F" >/dev/null 2>&1; then
     warn "ZIP is encrypted / needs a password — see PASSWORD GUESSING below"
   fi
 fi
+# Android APK — static mobile triage (an APK is a zip: decompile + dump manifest + scan native libs)
+is_apk=0
+case "$F" in *.apk|*.APK) is_apk=1;; esac
+case "$TYPE" in *Android*) is_apk=1;; esac
+[ -f "$OUT/unzip/AndroidManifest.xml" ] && is_apk=1
+if [ "$is_apk" = 1 ]; then
+  sec "ANDROID APK (mobile — static)"
+  if [ "$NO_EXTRACT" = 0 ]; then
+    mkout; mkdir -p "$OUT/apk"; APK_ABS="$(cd "$(dirname "$F")" && pwd)/$(basename "$F")"
+    if have aapt; then echo "  -- manifest (aapt badging):"; logcmd "aapt dump badging \"$F\""
+      aapt dump badging "$F" 2>/dev/null | grep -aiE "package:|launchable|uses-permission|application-label" | head -30 | sed 's/^/    /'; fi
+    if have jadx; then logcmd "jadx -d \"$OUT/apk/jadx\" \"$F\""
+      jadx -d "$OUT/apk/jadx" "$F" >/dev/null 2>&1 || true; note "jadx sources -> $OUT/apk/jadx/ (can be slow on large APKs)"; fi
+    if have apktool; then logcmd "apktool d -f -o \"$OUT/apk/apktool\" \"$F\""
+      apktool d -f -o "$OUT/apk/apktool" "$APK_ABS" >/dev/null 2>&1 || true; note "apktool smali/res -> $OUT/apk/apktool/"; fi
+    # native libraries: strings for flags / urls / keys
+    find "$OUT/unzip/lib" "$OUT/apk/apktool/lib" -name '*.so' -print0 2>/dev/null \
+      | xargs -0 -r strings -n 6 2>/dev/null > "$OUT/apk/native-strings.txt"
+    [ -s "$OUT/apk/native-strings.txt" ] && note "native .so strings -> $OUT/apk/native-strings.txt"
+    # flag sweep across the decompiled tree
+    atok="$(flagtok_in "$OUT/apk")"; [ -n "$atok" ] && gotflag "flag in APK sources: $atok" "APK: $atok"
+    # common secret / endpoint hotspots (dim if none) — filter framework-package noise
+    ahits="$(grep -aErnI -iE "$FLAGTOK|api[_-]?key|secret|password|BASE64|https?://[a-z0-9.-]+" "$OUT/apk" 2>/dev/null \
+             | grep -aviE "/kotlin/|/androidx/|/android/support/|R\\\$" | head -20)"
+    if [ -n "$ahits" ]; then note "APK secret/endpoint hits (first 20 — expect noise):"; printf '%s\n' "$ahits" | sed 's/^/    /'
+    else dim "no obvious secrets/endpoints in decompiled sources"; fi
+  else warn "-n given — skipping APK decompilation"; fi
+fi
 # PDF: pull embedded images + attachments (TCTT hides objects/streams inside PDFs)
 case "$TYPE" in *PDF*)
   if have pdfinfo || have pdfimages || have pdfdetach; then

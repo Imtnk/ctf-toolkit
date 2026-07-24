@@ -79,3 +79,9 @@ unix-ar==0.2.1
 urllib3==2.7.0
 z3-solver==4.13.0.0
 zstandard==0.25.0
+
+# --- web (JWT forgery, HTML parsing) + mobile dynamic (installed via install.sh) ---
+PyJWT
+beautifulsoup4
+frida-tools
+objection

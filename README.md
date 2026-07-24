@@ -33,9 +33,11 @@ cd ~/ctf-toolkit
 ./install.sh                 # symlinks bin/ctf-file, bin/ctf-eval, and the `ai` launcher onto PATH
 ```
 
-Dependencies are **stdlib-only** for the Python glue (`urllib`, `json`, `subprocess`); the CTF power
-comes from the system tools it shells out to. See `requirements.txt` for the optional Python libs
-(pwntools, pycryptodome, z3) used by the agent's `python_exec` tool.
+The Python glue is **stdlib-only** (`urllib`, `json`, `subprocess`); the CTF power comes from the
+system tools it shells out to. `install.sh` provisions the full toolset across every competition
+category — forensics, RE/pwn, web, crypto, network, and mobile (see **Toolset by category** below).
+`requirements.txt` lists the Python libs (pwntools, pycryptodome, z3, PyJWT, beautifulsoup4, …) the
+agent's `python_exec` tool draws on.
 
 ### Environment
 
@@ -45,7 +47,7 @@ comes from the system tools it shells out to. See `requirements.txt` for the opt
 | `CTF_REMOTE_MODEL` | `qwen3.6-35b-a3b` | Remote model id |
 | `CTF_REMOTE_BASE_URL` | `https://gateway.9arm.co/v1` | OpenAI-compatible base (`POST {base}/chat/completions`) |
 | `CTF_BRAIN` | `remote` | Set to `local` to force the Ollama brain globally |
-| `CTF_AI_HOST` | `localhost` | Ollama host for the local brain / fallback (e.g. a Mac at `192.168.1.11`) |
+| `CTF_AI_HOST` | `localhost` | Ollama host for the local brain / fallback (prefer a stable Tailscale name — see *Local Ollama is optional*) |
 
 One-time key setup (paste the real key yourself — it never passes through anyone else):
 
@@ -64,7 +66,8 @@ echo '[ -f ~/.config/ctf-toolchain/secrets.env ] && source ~/.config/ctf-toolcha
 ### `ctf-file` — forensics triage
 
 Runs a battery of forensics tools over a file (type ID, strings, metadata, embedded-file carving,
-stego, archive cracking) and prints a report. Extracted payloads land in `./<file>-work/`.
+stego, archive cracking) and prints a report. Recognizes **Android APKs** and auto-decompiles them
+(jadx + apktool, manifest via aapt, native-lib strings). Extracted payloads land in `./<file>-work/`.
 
 ```bash
 ctf-file suspicious.png                 # default triage
@@ -138,6 +141,33 @@ warning); a remote error at call time falls back to local automatically. Local `
 is the refusal fallback.
 
 ---
+
+## Toolset by category
+
+`install.sh` provisions tools for every competition category (the AI brain shells out to these — it
+never solves in its head). **Bold** = added most recently.
+
+| Category | Tools |
+|---|---|
+| **Digital Forensic** | `ctf-file` triage: binwalk, foremost, exiftool, steghide, stegseek, zsteg, outguess, sleuthkit, volatility3, oletools, pdf/qr/audio |
+| **Reverse Eng. & Pwnable** | gdb+gef, radare2/rizin, ghidra, objdump/readelf/nm, checksec, ROPgadget, ropper, **one_gadget**, **patchelf**, **seccomp-tools**, **pwninit**, **strace**/**ltrace**, pwntools, z3, capstone, unicorn, angr |
+| **Web Application** | curl, ffuf, gobuster, feroxbuster, wfuzz, sqlmap, nikto, nuclei, whatweb, httpx, burpsuite, zaproxy, **jq**, requests, **PyJWT**, **beautifulsoup4** |
+| **Network Security** | tshark, tcpdump, tcpflow, nmap, scapy, wireshark |
+| **Cryptography** | openssl, hashcat, john, pycryptodome, sympy, gmpy2, z3 |
+| **Mobile Security** | `ctf-file` auto-APK triage: jadx, apktool, dex2jar, aapt, apksigner, adb; **frida-tools**/**objection** for dynamic hooking (needs a device/emulator) |
+| **Programming** | python3 (+ the agent's `python_exec`), gcc, nasm, xxd |
+
+Only **SageMath** is intentionally skipped (heavy; install it yourself if a challenge needs lattice /
+advanced-ECC crypto). Everything else is handled by `install.sh`.
+
+**Approach notes.** *Pwn/RE:* the brain triages (mitigations via `checksec`, function/vuln spotting,
+gadget listing) and scaffolds a pwntools script with a local/remote toggle — pwntools does the offset
+math, `pwninit`/`one_gadget` handle supplied-libc leaks; a human (or a tight `python_exec` loop) drives
+the final exploit. *Web:* fingerprint (whatweb/httpx) → discover (ffuf) → **hypothesis-first** targeted
+request for the bug class (SQLi/SSTI/IDOR/JWT/LFI/SSRF/deserialization), using `requests` for stateful
+chains; fall back to sqlmap/nuclei only when a manual hypothesis stalls. *Mobile (lowest priority):*
+static only — `ctf-file` auto-decompiles the APK; grep the jadx/smali output for flags, secrets, and
+endpoints. Add frida/objection + an emulator only for runtime-hooking challenges.
 
 ## Agent loop (ReAct)
 
