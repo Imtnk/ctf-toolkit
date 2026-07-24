@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Local CTF AI helper — Ollama on localhost.
+"""CTF AI helper — remote gateway brain by default, local Ollama fallback.
 
-One-shot (backward-compatible):
+One-shot (brain: remote gateway by default, else local Ollama; --local forces local):
     echo "solve this RSA: n=... e=... c=..." | python3 ai.py
     cat challenge.py | python3 ai.py "find the vulnerability"
+    python3 ai.py --local "quick question"        # force the local Ollama brain
 
 Agentic loop (ReAct, multi-step):
     python3 ai.py agent "what type is ./chal and what are its strings?"
@@ -11,13 +12,13 @@ Agentic loop (ReAct, multi-step):
     python3 ai.py agent --dry-run "what would you do with ./chal?"
     python3 ai.py agent -m dolphin "..."
 """
-import sys, os, json, urllib.request, argparse
+import sys, os, urllib.request, argparse
 
 # Ollama host. Defaults to localhost (the Mac runs the model server locally);
 # remote clients (e.g. Kali over LAN) export CTF_AI_HOST=192.168.1.11
 HOST  = os.environ.get("CTF_AI_HOST", "localhost")
-MODEL = "deepseek-r1:14b"
-URL   = f"http://{HOST}:11434/api/chat"
+
+ONESHOT_SYSTEM = "You are a CTF expert. Be direct and provide working solutions."
 
 
 def server_up(timeout=4):
@@ -29,21 +30,6 @@ def server_up(timeout=4):
             return True
     except Exception:
         return False
-
-
-def ask(prompt, system="You are a CTF expert. Be direct and provide working solutions.", model=MODEL):
-    payload = json.dumps({
-        "model": model,
-        "stream": False,
-        "options": {"num_ctx": 8192, "temperature": 0.15},
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": prompt},
-        ],
-    }).encode()
-    req = urllib.request.Request(URL, data=payload, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req) as r:
-        return json.load(r)["message"]["content"]
 
 
 def cmd_agent(args):
@@ -109,13 +95,35 @@ def cmd_agent(args):
         print("\n[agent exited without a result]")
 
 
-def cmd_oneshot(prompt, model=MODEL):
+def cmd_oneshot(prompt, force_local=False):
+    """One-shot Q&A. Same brain policy as the agent: the remote gateway by default
+    (when a key is set and not --local/CTF_BRAIN=local), else local Ollama; a remote
+    failure degrades to local. The final answer prints to stdout (pipe-friendly)."""
     if not prompt:
-        sys.exit("usage: ai.py [prompt]   (and/or pipe content on stdin)")
+        sys.exit("usage: ai.py [--local] [prompt]   (and/or pipe content on stdin)")
+    from agent import config, llm
+
+    model = config.LOCAL_MODEL if force_local else config.BRAIN_MODEL
+    if config.is_remote(model) and not config.REMOTE_API_KEY:
+        model = config.LOCAL_MODEL   # no key → local (llm.chat would warn+fallback anyway)
+
+    messages = [{"role": "system", "content": ONESHOT_SYSTEM},
+                {"role": "user",   "content": prompt}]
+
+    if config.is_remote(model):
+        try:
+            # stream_echo=False keeps stdout clean for piping; the final answer is printed below.
+            print(llm.chat(messages, model=model, temperature=0.15, stream_echo=False))
+            return
+        except Exception as e:
+            print(f"[ai.py] remote brain failed ({e}) — falling back to local", file=sys.stderr)
+            model = config.LOCAL_MODEL
+
+    # Local Ollama path (default fallback / --local).
     if not server_up():
-        sys.exit(f"[ai.py] Ollama not reachable at {HOST}:11434 — is the Mac awake and reachable? "
+        sys.exit(f"[ai.py] Ollama not reachable at {HOST}:11434 — is it running and reachable? "
                  f"(export CTF_AI_HOST=<ip> if its LAN address changed)")
-    print(ask(prompt, model=model))
+    print(llm.chat(messages, model=model, host=config.HOST, num_ctx=8192, temperature=0.15))
 
 
 def main():
@@ -151,11 +159,15 @@ def main():
         args = p.parse_args(sys.argv[2:])
         cmd_agent(args)
     else:
+        # One-shot: a leading --local/--remote toggles the brain; the rest is the prompt.
+        argv = sys.argv[1:]
+        force_local = False
+        while argv and argv[0] in ("--local", "--remote"):
+            force_local = argv.pop(0) == "--local"
         stdin  = "" if sys.stdin.isatty() else sys.stdin.read()
-        cli    = " ".join(sys.argv[1:])
+        cli    = " ".join(argv)
         prompt = f"{cli}\n\n{stdin}".strip() if stdin and cli else (stdin or cli)
-        model  = MODEL
-        cmd_oneshot(prompt, model=model)
+        cmd_oneshot(prompt, force_local=force_local)
 
 
 if __name__ == "__main__":

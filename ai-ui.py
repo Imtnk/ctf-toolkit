@@ -3,16 +3,18 @@
 
 Usage:
   ai                       # interactive menu
-  ai "<question>"          # one-shot passthrough (local Ollama)
+  ai "<question>"          # one-shot passthrough (remote brain by default)
   ai agent "<task>" ...    # agent passthrough (every ai.py flag works)
   ai -h                    # this help
 
-Thin wrapper around ~/ctf-toolchain/ai.py, always run from its own directory so
-the `agent` package imports. Bare `ai` opens a menu; any args pass straight through.
+Thin wrapper around the sibling ai.py, always run from its own directory so the
+`agent` package imports. Bare `ai` opens a menu; any args pass straight through.
 """
 import os, sys, signal, subprocess
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# realpath so a PATH symlink (e.g. ~/.local/bin/ai -> repo/ai-ui.py) resolves back
+# to the repo, where ai.py and the `agent` package live.
+HERE = os.path.dirname(os.path.realpath(__file__))
 AI   = os.path.join(HERE, "ai.py")
 TTY  = sys.stdout.isatty()
 sys.path.insert(0, HERE)                       # so `from agent import config` works anywhere
@@ -60,7 +62,8 @@ def _prompt(label):
 def do_ask():
     q = _prompt("question> ")
     if q:
-        launch([q])
+        # Honour the session brain toggle for one-shot too (ai.py accepts a leading --local).
+        launch((["--local"] if STATE["local"] else []) + [q])
 
 
 def do_agent():

@@ -4,8 +4,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SCRIPT="$HERE/ctf-file"
-[ -f "$SCRIPT" ] || { echo "error: ctf-file not found next to install.sh"; exit 1; }
+[ -f "$HERE/bin/ctf-file" ] || { echo "error: bin/ctf-file not found next to install.sh"; exit 1; }
 
 # ---- pick an install dir on PATH -----------------------------------------
 if printf '%s' ":$PATH:" | grep -q ":$HOME/.local/bin:"; then
@@ -47,9 +46,14 @@ else
   echo "   pipx not present — run 'sudo apt-get install -y pipx' then 'pipx install volatility3' for memory support"
 fi
 
-# ---- install the script ---------------------------------------------------
-echo "==> Installing ctf-file -> $BIN/ctf-file"
-install -Dm755 "$SCRIPT" "$BIN/ctf-file"
+# ---- install the commands (symlinks into this repo, so `git pull` updates them) ----
+mkdir -p "$BIN"
+chmod +x "$HERE/bin/ctf-file" "$HERE/bin/ctf-eval" "$HERE/ai-ui.py" "$HERE/ai.py" 2>/dev/null || true
+echo "==> Linking commands into $BIN (symlinks -> $HERE)"
+ln -sf "$HERE/bin/ctf-file" "$BIN/ctf-file"
+ln -sf "$HERE/bin/ctf-eval" "$BIN/ctf-eval"
+ln -sf "$HERE/ai-ui.py"     "$BIN/ai"
+echo "    ctf-file, ctf-eval, ai -> $HERE"
 
 # ---- ensure PATH ----------------------------------------------------------
 if ! printf '%s' ":$PATH:" | grep -q ":$BIN:"; then

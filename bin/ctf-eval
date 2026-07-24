@@ -11,6 +11,7 @@ Usage:
   ctf-eval <file> --fast              # local qwen2.5-coder (faster, no <think>) — implies --local
   ctf-eval <file> --model dolphin-llama3:8b   # a specific local Ollama model — implies --local
   ctf-eval <file> --offline           # skip all models, deterministic heuristic eval
+  ctf-eval <file> -v                  # verbose: stream the model's live thinking/output to stderr
   ctf-eval <file> -- -d hard -c       # everything after `--` is passed to ctf-file
   ctf-eval -h
 
@@ -44,20 +45,44 @@ CHAT_URL  = f"{BASE_URL}/api/chat"
 # ── Remote "brain" (OpenAI-compatible gateway) ────────────────────────────────
 # Default evaluator when a key is present. Only the KEY is secret — it comes from
 # the env (sourced from ~/.config/ctf-toolchain/secrets.env, chmod 600, out of any repo).
-# ctf-eval can't import the agent package, so this mirrors agent/config.py + agent/llm.py.
-REMOTE_MODEL   = os.environ.get("CTF_REMOTE_MODEL", "qwen3.6-35b-a3b")
-REMOTE_BASE    = os.environ.get("CTF_REMOTE_BASE_URL", "https://gateway.9arm.co/v1").rstrip("/")
-REMOTE_KEY     = os.environ.get("CTF_REMOTE_API_KEY", "")
-REMOTE_TIMEOUT = int(os.environ.get("CTF_REMOTE_TIMEOUT", "300"))
-REMOTE_ENABLED = os.environ.get("CTF_BRAIN", "remote").lower() != "local"
-REMOTE_MAX_TOKENS = int(os.environ.get("CTF_REMOTE_MAX_TOKENS", "4096"))  # bound output; leaves room for reasoning + answer
-# Gateway is behind Cloudflare, which 403s (error 1010) the default urllib UA.
-REMOTE_UA      = os.environ.get(
-    "CTF_REMOTE_USER_AGENT",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-# The remote model has a much larger context window than the local one, so give
-# it more of the report + extracted artifacts than the local-sized caps below.
+#
+# ONE source of truth for the brain config: reuse agent/config.py when it's
+# importable (ctf-eval ships in the same repo, bin/ alongside agent/). Falls back
+# to reading the same env vars directly if run detached from the package (e.g. an
+# old standalone copy). The streaming call itself (remote_chat) still lives here
+# because it captures `reasoning_content` for the eval trace, which agent/llm.py's
+# chat() doesn't return.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+try:
+    from agent import config as _cfg
+except Exception:
+    _cfg = None
+
+if _cfg is not None:
+    REMOTE_MODEL      = _cfg.REMOTE_MODEL
+    REMOTE_BASE       = _cfg.REMOTE_BASE_URL
+    REMOTE_KEY        = _cfg.REMOTE_API_KEY
+    REMOTE_TIMEOUT    = _cfg.REMOTE_TIMEOUT
+    REMOTE_ENABLED    = _cfg.REMOTE_ENABLED
+    REMOTE_MAX_TOKENS = _cfg.REMOTE_MAX_TOKENS
+    REMOTE_UA         = _cfg.REMOTE_USER_AGENT
+else:
+    REMOTE_MODEL   = os.environ.get("CTF_REMOTE_MODEL", "qwen3.6-35b-a3b")
+    REMOTE_BASE    = os.environ.get("CTF_REMOTE_BASE_URL", "https://gateway.9arm.co/v1").rstrip("/")
+    REMOTE_KEY     = os.environ.get("CTF_REMOTE_API_KEY", "")
+    REMOTE_TIMEOUT = int(os.environ.get("CTF_REMOTE_TIMEOUT", "300"))
+    REMOTE_ENABLED = os.environ.get("CTF_BRAIN", "remote").lower() != "local"
+    REMOTE_MAX_TOKENS = int(os.environ.get("CTF_REMOTE_MAX_TOKENS", "4096"))
+    # Gateway is behind Cloudflare, which 403s (error 1010) the default urllib UA.
+    REMOTE_UA      = os.environ.get(
+        "CTF_REMOTE_USER_AGENT",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+# Report/artifact caps are eval-specific (not in agent/config.py). The remote model
+# has a much larger context window than the local one, so give it more of the
+# report + extracted artifacts than the local-sized caps below.
 REMOTE_REPORT_CAP        = int(os.environ.get("CTF_REMOTE_REPORT_CAP", "60000"))
 REMOTE_ARTIFACT_FILE_CAP  = 12000
 REMOTE_ARTIFACT_TOTAL_CAP = 32000
@@ -477,7 +502,12 @@ def print_summary(ev, model):
     v = ev["verdict"]
     vcol = "32" if v == "SOLVED" else ("33" if v == "NEEDS_MORE_WORK" else "36")
     print(c("36;1", "=== EVAL ===") if C else "=== EVAL ===")
-    print(f"  model      : {model}")
+    # Cost signal: amber for the paid remote gateway, green for a free local/offline
+    # evaluator. A "remote error → local/heuristic" fall still costs (the remote call
+    # was made), so a used_model that mentions the remote id counts as paid.
+    paid = REMOTE_MODEL in model
+    cost = c("33", "remote · paid") if paid else c("32", "local · free")
+    print(f"  brain      : {model}  ({cost})")
     print(f"  verdict    : {c(vcol+';1', v)}")
     if ev["flag"]:
         tag = "verified" if ev["flag_verified"] else "UNVERIFIED"
@@ -514,6 +544,21 @@ def write_json(path, ev, model, base, report_file, trace_file, rflags,
     return doc
 
 
+# ---------------------------------------------------------------- eval dispatch
+def run_model_eval(chat_fn, label, report, rflags, artifact_text, trace_path):
+    """Call chat_fn() -> (content, reasoning), write the eval trace, and parse the
+    reply into a verdict. Raises on transport failure so the caller can fall down
+    the degrade ladder (remote → local → offline). Returns (ev, used_model, trace_file)."""
+    content, reasoning = chat_fn()
+    answer, _ = split_think(content)     # also handles models that inline <think> in content
+    with open(trace_path, "w", encoding="utf-8", errors="replace") as f:
+        if reasoning.strip():
+            f.write("=== REASONING (model thinking) ===\n" + reasoning.strip() + "\n\n")
+        f.write("=== ANSWER (parsed for verdict) ===\n" + content.strip() + "\n")
+    ev, used_model = eval_or_fallback(answer, report, rflags, artifact_text, label, label)
+    return ev, used_model, os.path.basename(trace_path)
+
+
 # ---------------------------------------------------------------- main
 def parse_args(argv):
     if "--" in argv:
@@ -524,12 +569,15 @@ def parse_args(argv):
     model = DEEPSEEK
     offline = False
     local = False        # True → force a local model (--local, --fast, or --model)
+    verbose = False      # True → stream the model's live thinking/output to stderr
     target = None
     i = 0
     while i < len(left):
         a = left[i]
         if a in ("-h", "--help"):
             print(__doc__); sys.exit(0)
+        elif a in ("-v", "--verbose"):
+            verbose = True
         elif a == "--fast":
             model = QWEN; local = True
         elif a == "--offline":
@@ -547,11 +595,11 @@ def parse_args(argv):
         else:
             eprint(f"[ctf-eval] unexpected arg {a}"); sys.exit(1)
         i += 1
-    return target, model, offline, local, passthrough
+    return target, model, offline, local, verbose, passthrough
 
 
 def main():
-    target, model, offline, local, passthrough = parse_args(sys.argv[1:])
+    target, model, offline, local, verbose, passthrough = parse_args(sys.argv[1:])
     if not target:
         eprint("usage: ctf-eval <file> [--fast|--model M|--offline] [-- ctf-file opts]"); sys.exit(1)
     if not os.path.isfile(target):
@@ -604,57 +652,58 @@ def main():
         prompt += ("\n\n--- BEGIN ARTIFACT CONTENTS ---\n"
                    f"{artifact_text}\n--- END ARTIFACT CONTENTS ---")
 
+    # ── Evaluator degrade ladder: remote brain → local Ollama → offline heuristic ──
+    # Each rung is only tried if the one above is unavailable or fails. --offline
+    # and a forced local model (--local/--fast/--model) short-circuit to their rung.
+    # Live thinking/output streaming is OFF by default (quiet: only the final verdict
+    # prints); -v/--verbose echoes the model's stream to stderr as it arrives.
+    echo = verbose
+
+    def _remote():
+        eprint(f"[ctf-eval] asking remote brain {REMOTE_MODEL} ({REMOTE_BASE}) ...")
+        return run_model_eval(lambda: remote_chat(SYSTEM, prompt, echo=echo),
+                              REMOTE_MODEL, report, rflags, artifact_text, trace_path)
+
+    def _local():
+        # D5 (resolved 2026-07-22): no dolphin refusal-fallback on the EVAL path.
+        # Forensics-report evaluation never triggers a refusal, and dolphin-8b grading a
+        # report would be lower quality than honestly surfacing INCONCLUSIVE. A refusal
+        # here just flows through as the model's answer.
+        eprint(f"[ctf-eval] asking {model} (keep_alive={KEEPALIVE}) ...")
+        return run_model_eval(lambda: stream_chat(model, SYSTEM, prompt, echo),
+                              model, report, rflags, artifact_text, trace_path)
+
     if offline:
         eprint("[ctf-eval] offline eval (requested)")
-        ev = heuristic_eval(report, rflags, "requested")
-        used_model = "offline-heuristic"
+        ev, used_model = heuristic_eval(report, rflags, "requested"), "offline-heuristic"
     elif use_remote:
-        eprint(f"[ctf-eval] asking remote brain {REMOTE_MODEL} ({REMOTE_BASE}) ...")
-        raw = None
         try:
-            content, reasoning = remote_chat(SYSTEM, prompt, echo=sys.stderr.isatty())
-            raw = True; used_model = REMOTE_MODEL
+            ev, used_model, trace_file = _remote()
         except Exception as e:
-            eprint(f"[ctf-eval] remote brain failed ({e}) — falling back to offline heuristic")
-            ev = heuristic_eval(report, rflags, f"remote error: {e}")
-            used_model = "offline-heuristic"
-        if raw is not None:
-            answer, _ = split_think(content)
-            with open(trace_path, "w", encoding="utf-8", errors="replace") as f:
-                if reasoning.strip():
-                    f.write("=== REASONING (model thinking) ===\n" + reasoning.strip() + "\n\n")
-                f.write("=== ANSWER (parsed for verdict) ===\n" + content.strip() + "\n")
-            trace_file = os.path.basename(trace_path)
-            ev, used_model = eval_or_fallback(answer, report, rflags, artifact_text,
-                                              used_model, "remote")
+            eprint(f"[ctf-eval] remote brain failed ({e})")
+            if server_up():          # ladder: fall through to the local model
+                eprint(f"[ctf-eval] falling back to local {model} ...")
+                try:
+                    ev, used_model, trace_file = _local()
+                except Exception as e2:
+                    eprint(f"[ctf-eval] local model failed ({e2}) — offline heuristic")
+                    ev, used_model = heuristic_eval(report, rflags,
+                                                    f"remote+local failed"), "offline-heuristic"
+            else:
+                eprint(f"[ctf-eval] {MAC_IP}:11434 unreachable — offline heuristic")
+                ev, used_model = heuristic_eval(report, rflags,
+                                                f"remote error: {e}"), "offline-heuristic"
     elif not server_up():
         eprint(f"[ctf-eval] offline eval ({MAC_IP}:11434 unreachable)")
-        ev = heuristic_eval(report, rflags, f"{MAC_IP}:11434 unreachable")
-        used_model = "offline-heuristic"
+        ev, used_model = heuristic_eval(report, rflags,
+                                        f"{MAC_IP}:11434 unreachable"), "offline-heuristic"
     else:
-        echo = sys.stderr.isatty()
-        eprint(f"[ctf-eval] asking {model} (keep_alive={KEEPALIVE}) ...")
-        raw = None
         try:
-            content, reasoning = stream_chat(model, SYSTEM, prompt, echo)
-            raw = True
+            ev, used_model, trace_file = _local()
         except Exception as e:
             eprint(f"[ctf-eval] model call failed ({e}) — falling back to offline heuristic")
-            ev = heuristic_eval(report, rflags, f"model error: {e}")
-            used_model = "offline-heuristic"
-        if raw is not None:
-            answer, _ = split_think(content)     # also handle models that inline <think> in content
-            # D5 (resolved 2026-07-22): no dolphin refusal-fallback on the EVAL path. Forensics-report
-            # evaluation never triggers a refusal, and dolphin-8b grading a report would be lower
-            # quality than honestly surfacing INCONCLUSIVE. Dolphin stays only on the offensive/ReAct
-            # path (ctf-toolchain). A refusal here just flows through as the model's answer.
-            with open(trace_path, "w", encoding="utf-8", errors="replace") as f:
-                if reasoning.strip():
-                    f.write("=== REASONING (model thinking) ===\n" + reasoning.strip() + "\n\n")
-                f.write("=== ANSWER (parsed for verdict) ===\n" + content.strip() + "\n")
-            trace_file = os.path.basename(trace_path)
-            ev, used_model = eval_or_fallback(answer, report, rflags, artifact_text,
-                                              used_model, "local model")
+            ev, used_model = heuristic_eval(report, rflags,
+                                            f"model error: {e}"), "offline-heuristic"
 
     print_summary(ev, used_model)
     write_json(json_path, ev, used_model, base, os.path.basename(report_path),
@@ -665,4 +714,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl+C during triage or a (possibly long) model stream: exit cleanly,
+        # no traceback. 130 = 128 + SIGINT, the conventional interrupted-by-Ctrl+C code.
+        eprint("\n[ctf-eval] interrupted")
+        sys.exit(130)
