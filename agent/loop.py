@@ -7,16 +7,68 @@ Phase 5 additions:
   - .agent/*.jsonl transcript written every step
   - --resume: load a prior transcript and continue
 """
-import hashlib, os, select, sys, time
+import hashlib, itertools, os, select, sys, threading, time
 from . import approval, config, context, llm, protocol, refusal, tools, transcript
 
 NO_PROGRESS_LIMIT = 3
 
 
+# ── Progress spinner (quiet mode) ─────────────────────────────────────────────
+# When not --verbose the brain's live tokens aren't echoed, so a blocking model
+# call (a remote "thinking" model can take many seconds) would look hung. This
+# tiny stderr spinner shows it's alive with an elapsed counter, and is wiped
+# before the step's result prints. Silent when stderr isn't a TTY (piped/logged).
+
+_SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+class _Spinner:
+    def __init__(self, label="thinking", enabled=True):
+        self.label = label
+        self.enabled = enabled and sys.stderr.isatty()
+        self._stop = threading.Event()
+        self._t = None
+
+    def __enter__(self):
+        if self.enabled:
+            self._t = threading.Thread(target=self._run, daemon=True)
+            self._t.start()
+        return self
+
+    def _run(self):
+        t0 = time.monotonic()
+        for ch in itertools.cycle(_SPIN_FRAMES):
+            if self._stop.is_set():
+                break
+            dt = time.monotonic() - t0
+            sys.stderr.write(f"\r\033[2m{ch} {self.label}… {dt:0.0f}s\033[0m\033[K")
+            sys.stderr.flush()
+            self._stop.wait(0.12)
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._t:
+            self._t.join()
+        if self.enabled:
+            sys.stderr.write("\r\033[K")   # wipe the spinner line
+            sys.stderr.flush()
+
+
+def _chat(messages, model, host, verbose, label="thinking"):
+    """A model call with a progress indicator. verbose → stream the brain's live
+    tokens (they are their own indicator); quiet → a spinner while the call blocks."""
+    if verbose:
+        return llm.chat(messages, model=model, host=host)
+    with _Spinner(label):
+        return llm.chat(messages, model=model, host=host, stream_echo=False)
+
+
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 _SYSTEM = """\
-You are a CTF expert agent. Solve the given challenge step by step.
+You are a CTF and security assistant agent. Complete the USER'S TASK step by step
+using tools. The task may be a flag hunt OR a plain request (list files, identify a
+binary, extract an archive, read a value). Do exactly what was asked — nothing more.
 
 Each turn output EXACTLY ONE JSON object — nothing before or after it.
 Always include the "thought" field (one line explaining your next action).
@@ -25,10 +77,12 @@ To call a tool:
 {{"thought":"<reason>","tool":"<name>","args":{{<args>}}}}
 
 To finish:
-{{"thought":"<summary>","tool":"finish","args":{{"answer":"<flag or full result>"}}}}
+{{"thought":"<summary>","tool":"finish","args":{{"answer":"<the answer>"}}}}
 
-Before calling finish, verify your answer is correct (re-read it from output,
-check the flag format, grep for it again if unsure).
+Call finish AS SOON AS the task is answered. If the task asked for a flag, put the
+flag{{...}} in "answer"; otherwise put the direct answer (e.g. the file listing).
+NOT every task has a flag — do not keep hunting for one when the user only asked for
+something else. Briefly re-read your answer from the tool output before finishing.
 
 Available tools:
 {catalog}
@@ -36,6 +90,8 @@ Available tools:
 Rules:
 - thought is REQUIRED on every turn
 - Output ONE JSON object only — no prose outside it
+- Finish as soon as you've answered the task; don't invent extra work or search for
+  a flag the task did not ask for
 - Never repeat an identical tool call you already made
 - Never decode, decrypt, or compute a value in your head (base64, hex, rot13,
   arithmetic, etc.) — run a tool to do it and read the result
@@ -52,20 +108,23 @@ def _build_system() -> str:
 
 _VERIFY_PROMPT = (
     'The agent proposes this answer: "{answer}"\n\n'
-    'Is this correct? If it looks like a valid CTF flag or complete result, '
-    'confirm with: {{"thought":"verified","tool":"finish","args":{{"answer":"{answer}"}}}}\n'
-    'If not, continue with a tool call to double-check.'
+    'Does it answer the task (a valid flag, OR the information the user asked for)? '
+    'If yes, confirm with: {{"thought":"verified","tool":"finish","args":{{"answer":"{answer}"}}}}\n'
+    'Only if it clearly does NOT answer the task, continue with a tool call to double-check.'
 )
 
 
 def _verify(answer: str, messages: list, model: str, host: str,
-            pinned: dict | None = None) -> str | None:
+            pinned: dict | None = None, verbose: bool = False) -> str | None:
     verify_msgs = messages + [
         {"role": "user", "content": _VERIFY_PROMPT.format(answer=answer)},
     ]
     if pinned is not None:
         verify_msgs = context.maybe_truncate(verify_msgs, pinned, config.context_char_budget(model))
-    raw = llm.chat(verify_msgs, model=model, host=host, temperature=0, stream_echo=False)
+    # Verification is an internal check — never spray its tokens (stream_echo=False),
+    # but show a spinner in quiet mode so the finish step doesn't look hung.
+    with _Spinner("verifying", enabled=not verbose):
+        raw = llm.chat(verify_msgs, model=model, host=host, temperature=0, stream_echo=False)
     try:
         obj = protocol.extract_json(raw)
         protocol.validate(obj)
@@ -184,12 +243,15 @@ def _interrupt_prompt() -> tuple[str | None, bool]:
     """
     try:
         note = input(
-            "\n\033[33m⏸ interrupted — type a hint to steer the agent "
-            "(Enter = resume, q = abort): \033[0m"
+            "\n\033[33m⏸ paused — Enter to resume · type a hint to steer · "
+            "q or Ctrl-C again to QUIT: \033[0m"
         ).strip()
     except (EOFError, KeyboardInterrupt):
-        return None, True
-    if note.lower() in ("q", "quit", "abort"):
+        # Second Ctrl-C (or EOF) at the prompt = quit hard and immediately, so a
+        # runaway loop always stops on a double Ctrl-C regardless of loop state.
+        print("\n\033[31m[aborted]\033[0m")
+        raise SystemExit(130)
+    if note.lower() in ("q", "quit", "abort", "exit", "stop"):
         return None, True
     return (note or None), False
 
@@ -205,6 +267,7 @@ def run(
     dry_run: bool = False,
     cwd: str | None = None,
     resume_messages: list | None = None,
+    verbose: bool = False,
 ) -> str | None:
 
     # ── initialise messages ───────────────────────────────────────────────────
@@ -237,7 +300,7 @@ def run(
 
     while budget_remaining > 0:
         step += 1
-        print(f"\n── step {step} ", end="", flush=True)
+        print(f"\n\033[1m── step {step}\033[0m", flush=True)
         t_step = time.monotonic()
 
         # ── mid-run steering check ────────────────────────────────────────────
@@ -252,7 +315,7 @@ def run(
 
         # ── call model ────────────────────────────────────────────────────────
         try:
-            raw = llm.chat(messages, model=current_model, host=host)
+            raw = _chat(messages, current_model, host, verbose)
         except KeyboardInterrupt:
             note, stop = _interrupt_prompt()
             if stop:
@@ -272,7 +335,7 @@ def run(
                 try:
                     messages = context.maybe_truncate(
                         messages, pinned, config.context_char_budget(current_model))
-                    raw = llm.chat(messages, model=current_model, host=host)
+                    raw = _chat(messages, current_model, host, verbose, label="local fallback")
                 except Exception as e2:
                     print(f"\n[llm error] local fallback also failed: {e2}")
                     break
@@ -297,7 +360,7 @@ def run(
                         try:
                             messages = context.maybe_truncate(
                                 messages, pinned, config.context_char_budget(current_model))
-                            raw = llm.chat(messages, model=current_model, host=host)
+                            raw = _chat(messages, current_model, host, verbose)
                             obj = protocol.extract_json(raw)
                             protocol.validate(obj)
                         except Exception:
@@ -313,7 +376,7 @@ def run(
                 messages.append({"role": "user", "content": correction})
                 messages = context.maybe_truncate(
                     messages, pinned, config.context_char_budget(current_model))
-                raw = llm.chat(messages, model=current_model, host=host)
+                raw = _chat(messages, current_model, host, verbose)
 
         if obj is None:
             break
@@ -326,7 +389,7 @@ def run(
         # ── repeat detection ──────────────────────────────────────────────────
         call_key = hashlib.md5(f"{tool_name}:{args}".encode()).hexdigest()
         if call_key in seen_calls and tool_name != "finish":
-            print(f"▸ [{thought}] {tool_name}  [DUPLICATE — skipping]")
+            print(f"▸ [{thought}] \033[1m{tool_name}\033[0m  \033[33m[DUPLICATE — skipping]\033[0m")
             new_msgs = [
                 {"role": "assistant", "content": raw},
                 {"role": "user", "content": f"You already ran {tool_name}({args}) and got that result. Try a different approach."},
@@ -350,7 +413,7 @@ def run(
             else:
                 tier = approval.tier_label(cmd_display)
                 tier_str = f"  \033[2m[{tier}]\033[0m"
-            print(f"({elapsed_model:.1f}s model)\n▸ [{thought}] {tool_name}({cmd_display}){tier_str}")
+            print(f"▸ \033[2m{elapsed_model:.1f}s\033[0m  [{thought}] \033[1m{tool_name}\033[0m({cmd_display}){tier_str}")
 
             # ── finish path ───────────────────────────────────────────────────
             if tool_name == "finish":
@@ -358,14 +421,13 @@ def run(
                 if dry_run:
                     print(f"  [dry-run] finish → {answer!r}")
                     return answer
-                print("  [verifying…]", end="", flush=True)
-                verified = _verify(answer, messages, current_model, host, pinned)
+                verified = _verify(answer, messages, current_model, host, pinned, verbose)
                 if verified:
-                    print(f"\n\033[32m✓ Answer verified:\033[0m {verified}")
+                    print(f"\033[32m✓ Answer verified:\033[0m {verified}")
                     if run_file:
                         transcript.append_finish(run_file, verified)
                     return verified
-                print("\n  [verification did not confirm — continuing]")
+                print("  [verification did not confirm — continuing]")
                 new_msgs = [
                     {"role": "assistant", "content": raw},
                     {"role": "user", "content": "Verification did not confirm the answer. Use a tool to double-check."},

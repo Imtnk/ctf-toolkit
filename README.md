@@ -134,8 +134,14 @@ ai agent --resume                       # resume the latest (or a specific) .age
 | `--local` | off | Force local Ollama instead of the remote gateway |
 | `--approve auto` | manual | Skip prompts for non-allowlisted commands |
 | `--dry-run` | off | Show planned commands; execute nothing |
+| `-v / --verbose` | off | Stream the brain's live thinking. Off by default — a spinner shows progress and only the step actions/results print |
 | `--max-steps` | 15 | Steps before the soft-budget pause |
 | `--resume [FILE]` | — | Resume latest (or specific) `.agent/*.jsonl` transcript |
+
+The agent is **quiet by default**: each step prints its `thought`, tool call, and result, with a
+spinner while the model thinks. Pass `-v` to stream the raw reasoning. Tasks needn't be flag hunts —
+a plain request ("list the files here", "identify this binary") finishes as soon as it's answered.
+**Ctrl-C** mid-run pauses to steer (type a hint), resume (Enter), or quit (`q`, or Ctrl-C again).
 
 **Selection:** the remote brain is used when a key is present and none of `CTF_BRAIN=local`,
 `--local`, or `-m <model>` is in play. With no key it degrades to local `deepseek-r1:14b` (one-time

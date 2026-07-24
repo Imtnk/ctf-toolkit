@@ -82,6 +82,7 @@ def cmd_agent(args):
             auto_approve=(args.approve == "auto"),
             dry_run=args.dry_run,
             resume_messages=resume_messages,
+            verbose=args.verbose,
         )
     except KeyboardInterrupt:
         # Belt-and-suspenders: the loop handles Ctrl+C during the main model call
@@ -149,6 +150,8 @@ def main():
                        help="auto = skip prompts for non-allowlisted commands (default: manual)")
         p.add_argument("--dry-run", action="store_true",
                        help="Show planned commands; execute nothing")
+        p.add_argument("-v", "--verbose", action="store_true",
+                       help="Stream the brain's live thinking (default: off — a spinner shows progress)")
         p.add_argument("--max-steps", type=int, default=15,
                        help="Steps before the soft-budget pause (default: 15)")
         p.add_argument(
