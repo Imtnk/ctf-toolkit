@@ -15,3 +15,5 @@ secrets.env
 .env
 *-work/
 examples/*-work/
+# extraction artifacts from running the example fixtures (locked.zip → flag.txt, etc.)
+examples/flag.txt
