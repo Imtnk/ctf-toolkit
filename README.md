@@ -245,15 +245,25 @@ Prefer the host's **Tailscale MagicDNS name** over a Wi-Fi DHCP lease so the add
 launchctl setenv OLLAMA_HOST 0.0.0.0     # then restart Ollama (macOS app: Settings → "Expose on the network")
 tailscale up                             # host must be on the tailnet
 
-# on Kali (WSL2): join the same tailnet, then use the stable name
-sudo tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock &
-sudo tailscale up                        # opens a login URL — authenticate once
+# on Kali (WSL2): join the same tailnet with the helper scripts, then use the stable name
+scripts/tailscale-start.sh               # starts tailscaled quietly + `tailscale up` (login once)
 export CTF_AI_HOST=my-macbook            # the host's MagicDNS name (stable), or its 100.x tailnet IP
 ctf-eval locked.zip --local
+scripts/tailscale-stop.sh                # disconnect + stop the daemon when you're done
 ```
 
-To start the Kali daemon on every WSL launch without systemd, add to `/etc/wsl.conf` (then
-`wsl --shutdown`):
+**Run tailscaled quietly.** In WSL2 (no systemd) `tailscaled` is a foreground daemon — start it with
+`&` and its logs stream into your terminal. `scripts/tailscale-start.sh` detaches it and redirects
+logs to `/var/log/tailscaled.log`. Note that `tailscale down` only disconnects the *node*; the daemon
+keeps running (and logging), so use `scripts/tailscale-stop.sh` to actually stop it.
+
+| Script | What it does |
+|---|---|
+| `scripts/tailscale-start.sh` | Start tailscaled detached (logs → file), then `tailscale up --hostname=kali-wsl`. Idempotent. `TS_HOSTNAME=` overrides the name. |
+| `scripts/tailscale-stop.sh` | `tailscale down` **and** stop the daemon so nothing lingers on your terminal. |
+
+To bring the daemon up silently on every WSL launch without systemd, add to `/etc/wsl.conf` (then
+`wsl --shutdown`); you still run `tailscale up` once to log in:
 
 ```ini
 [boot]
