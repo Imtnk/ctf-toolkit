@@ -181,14 +181,51 @@ continues; the system prompt is rebuilt fresh (catalog changes take effect).
 
 ---
 
-## Local Ollama fallback (optional)
+## Local Ollama is optional
 
-If you run Ollama on a LAN box (e.g. a Mac), point Kali at it and set `CTF_BRAIN=local` (or pass
-`--local`) to use it as the brain:
+The default brain is the **remote gateway**, so with a valid API key the toolkit works fully with
+**no local model at all** — no Mac, no Ollama, no LAN. A local Ollama is only a *fallback*.
+
+### Remote brain only (just an API key)
+
+The minimal setup, and all most people need. Put three vars in
+`~/.config/ctf-toolchain/secrets.env` (chmod 600, sourced from your shell rc):
 
 ```bash
-export CTF_AI_HOST=192.168.1.11         # the Ollama host's LAN IP (DHCP — may drift)
+export CTF_REMOTE_API_KEY=sk-...                         # your key (the only secret)
+export CTF_REMOTE_BASE_URL=https://gateway.9arm.co/v1    # any OpenAI-compatible endpoint
+export CTF_REMOTE_MODEL=qwen3.6-35b-a3b                  # a model that endpoint serves
+```
+
+With this alone: `ctf-eval <file>`, `ai "…"`, and `ai agent "…"` all run on the remote brain, and
+`ctf-eval` degrades to a **deterministic offline heuristic** if a remote call ever fails — still no
+local model required. Only these *fallback* rungs use a local Ollama, and each is silently skipped
+when it's absent: the agent's remote-error retry, the refusal→`dolphin` switch (agent path only),
+and `ai.py`'s one-shot on remote failure. `CTF_AI_HOST` can stay unset (defaults to `localhost`).
+
+### Optional local Ollama fallback (e.g. a Mac), reached over Tailscale
+
+If you *do* run Ollama on another box, point Kali at it and set `CTF_BRAIN=local` (or pass `--local`).
+Prefer the host's **Tailscale MagicDNS name** over a Wi-Fi DHCP lease so the address never drifts:
+
+```bash
+# on the Ollama host (e.g. the Mac): serve on the tailnet, not just localhost
+launchctl setenv OLLAMA_HOST 0.0.0.0     # then restart Ollama (macOS app: Settings → "Expose on the network")
+tailscale up                             # host must be on the tailnet
+
+# on Kali (WSL2): join the same tailnet, then use the stable name
+sudo tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock &
+sudo tailscale up                        # opens a login URL — authenticate once
+export CTF_AI_HOST=my-macbook            # the host's MagicDNS name (stable), or its 100.x tailnet IP
 ctf-eval locked.zip --local
+```
+
+To start the Kali daemon on every WSL launch without systemd, add to `/etc/wsl.conf` (then
+`wsl --shutdown`):
+
+```ini
+[boot]
+command = /usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock >/var/log/tailscaled.log 2>&1 &
 ```
 
 | Model | Role |
