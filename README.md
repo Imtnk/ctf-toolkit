@@ -1,5 +1,7 @@
 # ctf-toolkit
 
+**v0.3** — remote-brain-first; full-category tooling (RE/pwn, web, mobile); Android APK triage.
+
 A CTF **forensics triage + AI-evaluation** toolkit that runs on **Kali (WSL2)**. It shells out to
 the installed toolset (binwalk, foremost, steghide, zsteg, john/hashcat, pwntools, …) and layers an
 AI **brain** on top for triage evaluation and an agentic ReAct loop.
@@ -142,9 +144,9 @@ is the refusal fallback.
 
 ---
 
-## Toolset by category
+## Tools coverage
 
-`install.sh` provisions tools for every competition category (the AI brain shells out to these — it
+Tools `install.sh` provisions, sorted by competition topic (the AI brain shells out to these — it
 never solves in its head). **Bold** = added most recently.
 
 | Category | Tools |
