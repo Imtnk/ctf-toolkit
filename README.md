@@ -1,6 +1,9 @@
 # ctf-toolkit
 
-**v0.3** — remote-brain-first; full-category tooling (RE/pwn, web, mobile); Android APK triage.
+**v0.4** — remote-brain-first; full-category tooling (RE/pwn, web, mobile); Android APK triage;
+**web-target triage (`ctf-web`) + reverse-shell generator/catcher (`ctf-rev`)**; web-safe
+reverse-shell delivery (`ctf-rev gen --for-web`, URL-encoded nc-mkfifo), PTY-upgrade guidance,
+and GTFOBins-driven privesc in the playbook + agent prompts.
 
 A CTF **forensics triage + AI-evaluation** toolkit that runs on **Kali (WSL2)**. It shells out to
 the installed toolset (binwalk, foremost, steghide, zsteg, john/hashcat, pwntools, …) and layers an
@@ -85,11 +88,15 @@ sitting only inside an extracted file still counts as ground truth. Outputs land
 
 ```bash
 ctf-eval locked.zip                     # triage + eval with the remote brain (default)
+ctf-eval http://10.10.10.10             # web target → ctf-web recon, then AI verdict
 ctf-eval locked.zip -v                  # + stream the model's live thinking to stderr
 ctf-eval locked.zip --local             # force local Ollama instead of the remote brain
 ctf-eval locked.zip --offline           # skip all models — deterministic heuristic only
 ctf-eval locked.zip -- -d hard -c       # everything after `--` is passed to ctf-file
 ```
+
+An `http(s)://` target is triaged with **`ctf-web`** (web recon + injection probes) instead of
+`ctf-file`; both write the same `<base>-work/` contract, so the evaluation is identical.
 
 | Flag | Meaning |
 |---|---|
@@ -103,6 +110,44 @@ ctf-eval locked.zip -- -d hard -c       # everything after `--` is passed to ctf
 **Degrade ladder:** remote brain → local Ollama → offline heuristic. Each rung is only tried if the
 one above is unavailable or fails. The summary tags the evaluator's **cost**: amber `remote · paid`
 vs green `local · free`.
+
+### `ctf-web` — website triage + reverse shell
+
+The `ctf-file` for web targets: runs all the basic checks on a URL and stages a reverse shell
+when it confirms RCE. Writes `<host>-work/` (report + per-tool artifacts + `findings.json`) using
+the **same contract as `ctf-file`**, so `ctf-eval http://target` works too.
+
+**Interactive by default** — a small menu that **always confirms your attacker IP (LHOST) first**;
+the LHOST persists in `~/.config/ctf-toolkit/ctf-web.json` until you change it. Pass `--auto` for a
+straight non-interactive run (also auto-selected when a non-TTY caller like `ctf-eval` drives it).
+
+```bash
+ctf-web http://10.10.10.10                   # interactive menu (asks LHOST, then run)
+ctf-web http://10.10.10.10 --auto            # non-interactive recon → 10.10.10.10-work/
+ctf-web 'http://site/?id=1' --auto --deep    # bigger wordlists + nikto/nuclei
+ctf-web 'http://site/ping?ip=x' --auto --rev 4444 --fire   # send exploit (listener must be up)
+```
+
+Checks: reachability + security headers, fingerprint (whatweb/httpx/wafw00f), sensitive files
+(`.git/`, `.env`, backups, `server-status`, …), content discovery (ffuf/feroxbuster/gobuster),
+vuln scan (nuclei; nikto under `--deep`), param discovery (arjun) + quick probes for SQLi, SSTI,
+LFI, reflected-XSS and command-injection. Each check is isolated — one failing tool never loses
+the report. **Safe by default:** no exploit fires without `--rev PORT --fire`.
+
+### `ctf-rev` — reverse-shell generator + catcher
+
+A local [revshells.com](https://www.revshells.com): build a payload and catch the callback.
+
+```bash
+ctf-rev gen bash 4444                  # bash /dev/tcp one-liner, LHOST auto-detected from tun0
+ctf-rev gen -a 4444                    # dump EVERY variant (python/php/perl/nc/socat/ps/…)
+ctf-rev gen bash 4444 --enc b64        # base64-wrapped (input-filter bypass); also --enc url
+ctf-rev gen -l                         # list shell types      ctf-rev ip   # print detected LHOST
+ctf-rev listen 4444                    # catch it: prefers pwncat-cs, then nc/ncat, then pure-python
+```
+
+`ctf-rev listen` prints the TTY-upgrade cheatsheet on connect and uses `pwncat-cs` (auto-TTY,
+history, up/download) when installed. The generator is also an agent tool (`revshell`).
 
 ### `ai` — one-shot Q&A + ReAct agent
 
@@ -159,7 +204,8 @@ never solves in its head). **Bold** = added most recently.
 |---|---|
 | **Digital Forensic** | `ctf-file` triage: binwalk, foremost, exiftool, steghide, stegseek, zsteg, outguess, sleuthkit, volatility3, oletools, pdf/qr/audio |
 | **Reverse Eng. & Pwnable** | gdb+gef, radare2/rizin, ghidra, objdump/readelf/nm, checksec, ROPgadget, ropper, **one_gadget**, **patchelf**, **seccomp-tools**, **pwninit**, **strace**/**ltrace**, pwntools, z3, capstone, unicorn, angr |
-| **Web Application** | curl, ffuf, gobuster, feroxbuster, wfuzz, sqlmap, nikto, nuclei, whatweb, httpx, burpsuite, zaproxy, **jq**, requests, **PyJWT**, **beautifulsoup4** |
+| **Web Application** | `ctf-web` triage + `ctf-rev` shells; curl, ffuf, gobuster, feroxbuster, wfuzz, sqlmap, nikto, nuclei, whatweb, httpx, burpsuite, zaproxy, **wafw00f**, **arjun**, **commix**, **dalfox**, **wpscan**, **hydra**, **jq**, requests, **PyJWT**, **beautifulsoup4** |
+| **Reverse shells** | `ctf-rev` (gen + listen), **socat**, **ncat**, **pwncat-cs** (auto-TTY catcher), **rlwrap** |
 | **Network Security** | tshark, tcpdump, tcpflow, nmap, scapy, wireshark |
 | **Cryptography** | openssl, hashcat, john, pycryptodome, sympy, gmpy2, z3 |
 | **Mobile Security** | `ctf-file` auto-APK triage: jadx, apktool, dex2jar, aapt, apksigner, adb; **frida-tools**/**objection** for dynamic hooking (needs a device/emulator) |
@@ -173,7 +219,9 @@ gadget listing) and scaffolds a pwntools script with a local/remote toggle — p
 math, `pwninit`/`one_gadget` handle supplied-libc leaks; a human (or a tight `python_exec` loop) drives
 the final exploit. *Web:* fingerprint (whatweb/httpx) → discover (ffuf) → **hypothesis-first** targeted
 request for the bug class (SQLi/SSTI/IDOR/JWT/LFI/SSRF/deserialization), using `requests` for stateful
-chains; fall back to sqlmap/nuclei only when a manual hypothesis stalls. *Mobile (lowest priority):*
+chains; fall back to sqlmap/nuclei only when a manual hypothesis stalls. `ctf-web` automates the
+first rungs and `ctf-rev` handles the RCE→shell payoff — the full method is in
+[docs/web-playbook.md](docs/web-playbook.md). *Mobile (lowest priority):*
 static only — `ctf-file` auto-decompiles the APK; grep the jadx/smali output for flags, secrets, and
 endpoints. Add frida/objection + an emulator only for runtime-hooking challenges.
 
@@ -194,6 +242,7 @@ Each turn: **model → JSON `{thought, tool, args}` → approval → execute →
 | `hexdump(path, n)` | auto | First n bytes, hex+ASCII |
 | `strings(path, min_len)` | auto | Printable strings |
 | `http_request(method, url, …)` | ask | Web requests via urllib |
+| `revshell(shell, lhost, lport)` | auto | Generate a reverse-shell one-liner (inert; catch with `ctf-rev listen`) |
 | `finish(answer)` | — | End loop; triggers verification first |
 
 ### Approval tiers
@@ -294,7 +343,9 @@ truncates long replies; the tools here already set it.
 ctf-toolkit/
   bin/
     ctf-file         # forensics triage (bash)
-    ctf-eval         # triage + AI verdict (python; reuses agent/config.py)
+    ctf-eval         # triage + AI verdict — file (ctf-file) or url (ctf-web)
+    ctf-web          # website triage + reverse shell; writes <host>-work/
+    ctf-rev          # reverse-shell generator + catcher (gen | listen | ip)
   ai.py              # one-shot + `agent` subcommand
   ai-ui.py           # `ai` launcher: menu + passthrough
   agent/
@@ -309,6 +360,6 @@ ctf-toolkit/
     context.py       # pinned-facts + maybe_truncate
   scripts/           # Ollama host helpers
   examples/          # sample runs
-  docs/              # forensics notes
+  docs/              # forensics notes + web-playbook.md
   install.sh · requirements.txt
 ```

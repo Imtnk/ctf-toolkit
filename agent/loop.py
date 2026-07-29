@@ -97,6 +97,15 @@ Rules:
   arithmetic, etc.) — run a tool to do it and read the result
 - Keep "thought" to ONE short sentence; never repeat text or loop
 - If stuck, explain in thought what you tried and try a different approach
+
+Exploitation notes (authorized CTF/lab targets only):
+- Reverse shells: through a WEB param / injected command, do NOT use `bash -i >& /dev/tcp`
+  (needs bash; injected cmds run under /bin/sh and the URL mangles it). Prefer an nc-mkfifo
+  or python3 payload and URL-encode it. Use the `revshell` tool / `ctf-rev gen --for-web`.
+- Privilege escalation: after RCE, run `sudo -n -l`, find SUID (`find / -perm -4000`), and
+  check capabilities. When a standard binary is exploitable, look it up on GTFOBins
+  (https://gtfobins.org/gtfobins) for the exact Sudo/SUID/Capabilities one-liner to get root
+  instead of guessing.
 """
 
 
@@ -154,8 +163,8 @@ def _warn_scope(cmd: str, cwd: str | None) -> None:
 def _gate(tool_name: str, args: dict, auto_approve: bool, cwd: str | None) -> bool:
     if tool_name == "finish":
         return True
-    if tool_name in ("read_file", "list_dir", "file_info", "hexdump", "strings"):
-        return True
+    if tool_name in ("read_file", "list_dir", "file_info", "hexdump", "strings", "revshell"):
+        return True   # revshell only generates a string; connecting is a separate manual step
     if tool_name == "write_file":
         return approval.check_write(args.get("path", ""), args.get("text", ""))
     if tool_name == "python_exec":

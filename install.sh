@@ -24,7 +24,11 @@ APT_FORENSICS="tshark tcpflow poppler-utils zbar-tools sleuthkit foremost testdi
 APT_REVERSE="patchelf strace ltrace gdb"
 # mobile security — static APK analysis (dynamic frida/objection via pipx below)
 APT_MOBILE="apktool jadx dex2jar adb apksigner aapt"
-APT_PKGS="$APT_CORE $APT_FORENSICS $APT_REVERSE $APT_MOBILE"
+# web application — discovery, fingerprint, scanners, exploitation (used by ctf-web)
+APT_WEB="ffuf gobuster feroxbuster wfuzz nikto whatweb wafw00f dirb seclists commix dalfox wpscan hydra nmap ncat socat rlwrap"
+# reverse-shell catcher (ctf-rev listen prefers pwncat-cs when present)
+APT_SHELL="netcat-traditional"
+APT_PKGS="$APT_CORE $APT_FORENSICS $APT_REVERSE $APT_MOBILE $APT_WEB $APT_SHELL"
 if command -v apt-get >/dev/null 2>&1; then
   sudo apt-get update -y
   # install what's available; don't abort the whole run if one package name differs
@@ -69,6 +73,23 @@ else
   echo "   pipx not present — run 'sudo apt-get install -y pipx' then 'pipx install volatility3' for memory support"
 fi
 
+echo "==> Installing web-exploitation CLIs (arjun, pwncat-cs, jwt_tool via pipx) ..."
+# arjun: HTTP param discovery (ctf-web uses it). pwncat-cs: auto-TTY reverse-shell catcher
+# (ctf-rev listen prefers it). jwt_tool: JWT tamper/attacks (complements the PyJWT lib).
+if command -v pipx >/dev/null 2>&1; then
+  for t in arjun pwncat-cs; do
+    pipx install "$t" || echo "   (pipx '$t' failed — the related feature will be skipped)"
+  done
+  pipx install git+https://github.com/ticarpi/jwt_tool 2>/dev/null || echo "   (jwt_tool skipped)"
+  pipx ensurepath >/dev/null 2>&1 || true
+else
+  echo "   pipx not present — 'sudo apt-get install -y pipx' then 'pipx install arjun pwncat-cs'"
+fi
+# nuclei / httpx (ProjectDiscovery, Go) power ctf-web's vuln scan + fingerprint. Kali packages
+# them; else install via 'go install' (see docs). Not fatal if absent — ctf-web skips them.
+command -v nuclei >/dev/null 2>&1 || sudo apt-get install -y nuclei 2>/dev/null || echo "   (nuclei not available — ctf-web will skip it)"
+command -v httpx  >/dev/null 2>&1 || sudo apt-get install -y httpx-toolkit 2>/dev/null || echo "   (httpx not available — ctf-web will skip it)"
+
 echo "==> Installing Python web libs (PyJWT, BeautifulSoup) ..."
 # Used by the agent's python_exec on the Web category (JWT forgery, HTML parsing).
 PIP_WEB="pyjwt beautifulsoup4"
@@ -94,12 +115,15 @@ fi
 
 # ---- install the commands (symlinks into this repo, so `git pull` updates them) ----
 mkdir -p "$BIN"
-chmod +x "$HERE/bin/ctf-file" "$HERE/bin/ctf-eval" "$HERE/ai-ui.py" "$HERE/ai.py" 2>/dev/null || true
+chmod +x "$HERE/bin/ctf-file" "$HERE/bin/ctf-eval" "$HERE/bin/ctf-web" "$HERE/bin/ctf-rev" \
+         "$HERE/ai-ui.py" "$HERE/ai.py" 2>/dev/null || true
 echo "==> Linking commands into $BIN (symlinks -> $HERE)"
 ln -sf "$HERE/bin/ctf-file" "$BIN/ctf-file"
 ln -sf "$HERE/bin/ctf-eval" "$BIN/ctf-eval"
+ln -sf "$HERE/bin/ctf-web"  "$BIN/ctf-web"
+ln -sf "$HERE/bin/ctf-rev"  "$BIN/ctf-rev"
 ln -sf "$HERE/ai-ui.py"     "$BIN/ai"
-echo "    ctf-file, ctf-eval, ai -> $HERE"
+echo "    ctf-file, ctf-eval, ctf-web, ctf-rev, ai -> $HERE"
 
 # ---- ensure PATH ----------------------------------------------------------
 if ! printf '%s' ":$PATH:" | grep -q ":$BIN:"; then

