@@ -44,9 +44,17 @@ def brain_line():
 def launch(args, shield_sigint=False):
     """Run ai.py in the USER'S current directory so the agent's tools act on the
     files you're in, not the repo. HERE goes on PYTHONPATH so the `agent` package
-    still imports. When shield_sigint, the parent ignores Ctrl+C so it reaches the
-    agent child's steer/abort handler, not us."""
-    prev = signal.signal(signal.SIGINT, signal.SIG_IGN) if shield_sigint else None
+    still imports.
+
+    When shield_sigint, we must let Ctrl+C reach the agent child (its loop has a
+    steer/abort handler) WITHOUT killing this parent menu. The obvious SIG_IGN is
+    WRONG: SIG_IGN is inherited across exec, and CPython refuses to install its
+    KeyboardInterrupt handler when it starts up with SIGINT already ignored, so the
+    child would swallow every Ctrl+C and become uninterruptible. Instead shield the
+    parent with a no-op *Python* handler: a function disposition resets to SIG_DFL
+    on exec, so the child gets a normal KeyboardInterrupt while this parent just
+    ignores the signal in its own process."""
+    prev = signal.signal(signal.SIGINT, lambda *a: None) if shield_sigint else None
     env = {**os.environ, "PYTHONPATH": HERE + os.pathsep + os.environ.get("PYTHONPATH", "")}
     try:
         subprocess.run([sys.executable, AI] + args, env=env)

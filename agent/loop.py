@@ -494,6 +494,24 @@ def run(
                     tool_name, args,
                     stream_to=_stream_line if tool_name in tools._STREAMING_TOOLS else None,
                 )
+            except KeyboardInterrupt:
+                # Ctrl+C while a tool runs (e.g. a long run_shell/decompile). The
+                # child shares our process group so it already got SIGINT; steer or
+                # abort cleanly instead of crashing the loop with a traceback.
+                note, stop = _interrupt_prompt()
+                if stop:
+                    print('\n  \x1b[31m[aborted by user]\x1b[0m')
+                    return None
+                follow = (f"[user hint] {note}" if note else
+                          "[the previous tool was interrupted by the user before it finished]")
+                new_msgs = [
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": follow},
+                ]
+                messages.extend(new_msgs)
+                if run_file:
+                    transcript.append_step(run_file, step, new_msgs)
+                continue
             except Exception as e:
                 result, exec_time = f"[tool error] {e}", 0.0
 
