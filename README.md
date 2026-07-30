@@ -1,6 +1,6 @@
 # ctf-toolkit
 
-**v0.4** — remote-brain-first; full-category tooling (RE/pwn, web, mobile); Android APK triage;
+**v0.5** — remote-brain-first; full-category tooling (RE/pwn, web, mobile); Android APK triage;
 **web-target triage (`ctf-web`) + reverse-shell generator/catcher (`ctf-rev`)**; web-safe
 reverse-shell delivery (`ctf-rev gen --for-web`, URL-encoded nc-mkfifo), PTY-upgrade guidance,
 and GTFOBins-driven privesc in the playbook + agent prompts.
@@ -35,7 +35,7 @@ your Kali (WSL2)                       brain (reasoning only)
 ```bash
 git clone https://github.com/Imtnk/ctf-toolkit.git ~/ctf-toolkit
 cd ~/ctf-toolkit
-./install.sh                 # symlinks bin/ctf-file, bin/ctf-eval, and the `ai` launcher onto PATH
+./install.sh                 # symlinks ctf-file, ctf-eval, ctf-web, ctf-rev, ctf-writeup, ctf-rec + `ai` onto PATH
 ```
 
 The Python glue is **stdlib-only** (`urllib`, `json`, `subprocess`); the CTF power comes from the
@@ -148,6 +148,48 @@ ctf-rev listen 4444                    # catch it: prefers pwncat-cs, then nc/nc
 
 `ctf-rev listen` prints the TTY-upgrade cheatsheet on connect and uses `pwncat-cs` (auto-TTY,
 history, up/download) when installed. The generator is also an agent tool (`revshell`).
+
+### `ctf-writeup` — session + artifacts → AI writeup
+
+The last step of a solve: capture what happened in the terminal **plus** the artifacts left
+behind in the `*-work/` dirs, and have the AI author a Markdown writeup. Output lands in a
+`-work/` folder (same contract as `ctf-eval`): `writeup.md` (the deliverable), `session.txt`
+(the captured session), `writeup-trace.txt` (raw model reply).
+
+```bash
+ctf-writeup                             # session-wide: all *-work/ in cwd → session-work/writeup.md
+ctf-writeup locked.zip                  # one challenge: reads locked.zip-work/, writes writeup.md there
+ctf-writeup http://10.10.10.10          # web target → <host[_port]>-work/
+ctf-writeup locked.zip --log run.log    # use an explicit session log (or pipe one on stdin)
+ctf-writeup locked.zip --style report   # standard (default) | concise | report
+ctf-writeup locked.zip --no-session     # artifacts only, skip session capture
+ctf-writeup locked.zip -v               # stream the model's live output
+ctf-writeup locked.zip --offline        # no model → deterministic template stub
+```
+
+Assumes the challenge is solved. If **no flag** is found in the ground truth (session +
+artifacts), it never invents one — the writeup ends with a **Suggested next steps** section
+instead. A flag the model quotes that isn't in the ground truth gets a hallucination warning
+appended. Same brain ladder as `ctf-eval` (remote gateway → local Ollama → offline stub).
+
+**Session capture** is auto-detected, robust source first:
+1. `--log FILE` or a piped stdin — used verbatim.
+2. a [`script`](#ctf-rec) typescript (`$CTF_SESSION_LOG` / newest `~/.ctf-sessions/*.log`) —
+   **preferred**: survives `clear`, `exit`, and blocking commands like `nc -lvnp`.
+3. `$TMUX` set — `tmux capture-pane` of the current pane (note: `clear` wipes tmux scrollback).
+4. fallback — recent shell history + every `*-work/commands.log`, labelled as reconstructed.
+
+### `ctf-rec` — record a session for `ctf-writeup`
+
+Start a CTF under `ctf-rec` and the whole session is captured to a `script` typescript that
+`ctf-writeup` reads automatically. This is the reliable capture path — a typescript keeps
+everything (`clear` can't wipe it, `exit` finalizes it, blocking-command output streams in live).
+
+```bash
+ctf-rec                                 # record → spawn $SHELL; `exit` (or Ctrl-D) stops
+ctf-rec box42                           # label the log: ~/.ctf-sessions/box42-<ts>.log
+ctf-rec -- 'strings chal | grep flag'   # record a single command instead of a shell
+```
 
 ### `ai` — one-shot Q&A + ReAct agent
 
@@ -346,6 +388,8 @@ ctf-toolkit/
     ctf-eval         # triage + AI verdict — file (ctf-file) or url (ctf-web)
     ctf-web          # website triage + reverse shell; writes <host>-work/
     ctf-rev          # reverse-shell generator + catcher (gen | listen | ip)
+    ctf-writeup      # session + *-work/ artifacts → AI Markdown writeup
+    ctf-rec          # record a session (script typescript) for ctf-writeup
   ai.py              # one-shot + `agent` subcommand
   ai-ui.py           # `ai` launcher: menu + passthrough
   agent/

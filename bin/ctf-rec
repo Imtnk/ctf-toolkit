@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# ctf-rec — record the terminal session to a `script` typescript, then drop into a
+# shell. `ctf-writeup` later reads the newest ~/.ctf-sessions/*.log (via $CTF_SESSION_LOG)
+# as the session ground truth.
+#
+# Why a typescript and not tmux/history: a `script` log survives everything an
+# interactive solve throws at it — `clear` (escape codes are just bytes in the file),
+# `exit` (the typescript is finalized on exit), and blocking commands like
+# `nc -lvnp 4444` (their output streams into the file live). tmux scrollback is wiped
+# by `clear`, and shell history keeps commands but no output.
+#
+# Usage:
+#   ctf-rec                 # start recording, spawn $SHELL; `exit` stops + prints the log path
+#   ctf-rec <name>          # label the log file (~/.ctf-sessions/<name>-<ts>.log)
+#   ctf-rec -- <cmd...>     # record a single command instead of an interactive shell
+set -euo pipefail
+
+DIR="${CTF_SESSIONS_DIR:-$HOME/.ctf-sessions}"
+mkdir -p "$DIR"
+TS="$(date +%Y%m%dT%H%M%S)"
+
+label=""
+# optional label (a leading non-dash, non-'--' word), then an optional '--' separator.
+if [ $# -gt 0 ] && [ "$1" != "--" ] && [ "${1#-}" = "$1" ]; then
+  label="$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')-"; shift
+fi
+[ "${1:-}" = "--" ] && shift
+LOG="$DIR/${label}${TS}.log"
+
+export CTF_SESSION_LOG="$LOG"
+
+echo "[ctf-rec] recording -> $LOG"
+echo "[ctf-rec] run your solve; type 'exit' (or Ctrl-D) to stop. Then: ctf-writeup [<target>]"
+
+# `script` flavors differ (util-linux vs BSD). util-linux (Kali) takes: -q quiet,
+# -f flush after each write (so a concurrent ctf-writeup sees a live log), then the
+# logfile. A trailing command runs non-interactively; no command => an interactive shell.
+if [ $# -gt 0 ]; then
+  script -q -f -c "$*" "$LOG"
+else
+  script -q -f "$LOG"
+fi
+
+echo "[ctf-rec] saved -> $LOG"
+echo "[ctf-rec] writeup:  ctf-writeup   (or  ctf-writeup <file|url>)"

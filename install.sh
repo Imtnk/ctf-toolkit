@@ -116,14 +116,16 @@ fi
 # ---- install the commands (symlinks into this repo, so `git pull` updates them) ----
 mkdir -p "$BIN"
 chmod +x "$HERE/bin/ctf-file" "$HERE/bin/ctf-eval" "$HERE/bin/ctf-web" "$HERE/bin/ctf-rev" \
-         "$HERE/ai-ui.py" "$HERE/ai.py" 2>/dev/null || true
+         "$HERE/bin/ctf-writeup" "$HERE/bin/ctf-rec" "$HERE/ai-ui.py" "$HERE/ai.py" 2>/dev/null || true
 echo "==> Linking commands into $BIN (symlinks -> $HERE)"
-ln -sf "$HERE/bin/ctf-file" "$BIN/ctf-file"
-ln -sf "$HERE/bin/ctf-eval" "$BIN/ctf-eval"
-ln -sf "$HERE/bin/ctf-web"  "$BIN/ctf-web"
-ln -sf "$HERE/bin/ctf-rev"  "$BIN/ctf-rev"
-ln -sf "$HERE/ai-ui.py"     "$BIN/ai"
-echo "    ctf-file, ctf-eval, ctf-web, ctf-rev, ai -> $HERE"
+ln -sf "$HERE/bin/ctf-file"    "$BIN/ctf-file"
+ln -sf "$HERE/bin/ctf-eval"    "$BIN/ctf-eval"
+ln -sf "$HERE/bin/ctf-web"     "$BIN/ctf-web"
+ln -sf "$HERE/bin/ctf-rev"     "$BIN/ctf-rev"
+ln -sf "$HERE/bin/ctf-writeup" "$BIN/ctf-writeup"
+ln -sf "$HERE/bin/ctf-rec"     "$BIN/ctf-rec"
+ln -sf "$HERE/ai-ui.py"        "$BIN/ai"
+echo "    ctf-file, ctf-eval, ctf-web, ctf-rev, ctf-writeup, ctf-rec, ai -> $HERE"
 
 # ---- ensure PATH ----------------------------------------------------------
 if ! printf '%s' ":$PATH:" | grep -q ":$BIN:"; then
