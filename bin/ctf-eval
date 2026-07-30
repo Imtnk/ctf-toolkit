@@ -43,12 +43,12 @@ Outputs (all under ./<file>-work/):
   eval.json           structured verdict (schema below), version-stamped
 
 Model reply schema (enforced + parsed):
-  VERDICT / FLAG / CONFIDENCE / WHY / NEXT_STEPS / COMMANDS
+  SUMMARY / VERDICT / FLAG / CONFIDENCE / WHY / NEXT_STEPS / COMMANDS
 """
 import os, sys, re, json, shutil, subprocess, urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone
 
-VERSION   = "1.0"
+VERSION   = "1.1"
 MAC_IP    = os.environ.get("CTF_AI_HOST", "192.168.1.11")   # Mac's LAN IP (DHCP — set CTF_AI_HOST if it drifts)
 BASE_URL  = f"http://{MAC_IP}:11434"
 CHAT_URL  = f"{BASE_URL}/api/chat"
@@ -113,7 +113,7 @@ REPORT_CAP = 24000                     # chars sent to the model (~6k tokens, fi
 # flag-shaped token, e.g. flag{...} ctf{...} key{...} synt{...}
 FLAG_RE = re.compile(r"\b[A-Za-z0-9_]{2,12}\{[^}\r\n]{1,120}\}")
 
-SCHEMA_KEYS = ["VERDICT", "FLAG", "CONFIDENCE", "WHY", "NEXT_STEPS", "COMMANDS"]
+SCHEMA_KEYS = ["SUMMARY", "VERDICT", "FLAG", "CONFIDENCE", "WHY", "NEXT_STEPS", "COMMANDS"]
 
 SYSTEM = (
     "You are a CTF forensics evaluator. You are given the raw output of an automated "
@@ -132,12 +132,20 @@ SYSTEM = (
     "breaks under /bin/sh) — suggest `ctf-rev gen --for-web <PORT>`. For privilege escalation "
     "after RCE (sudo -l / SUID / capabilities on a standard binary), point COMMANDS at the exact "
     "GTFOBins one-liner (https://gtfobins.org/gtfobins) rather than guessing.\n\n"
-    "Reply with EXACTLY these six fields, each on its own line, nothing before or after:\n"
+    "Tailor NEXT_STEPS to the detected file type: an executable (ELF/PE/Mach-O) -> run it in a "
+    "sandbox/VM (./<file>), ltrace/strace it, strings -n 6, decompile with Ghidra or r2 -A, "
+    "checksec; an archive -> crack it (ctf-file <file> -d hard -c) and recurse into nested "
+    "archives; an image -> zsteg/steghide/stegseek/exiftool, appended-data or LSB stego; audio -> "
+    "spectrogram (sox <file> -n spectrogram), DTMF/morse; a pcap -> follow the TCP/HTTP streams and "
+    "export objects (tshark/Wireshark); pdf/office -> pdf-parser/pdfid/olevba; disk/memory -> "
+    "sleuthkit (fls/icat) or Volatility (vol -f); text/encoded -> give the exact decode command.\n\n"
+    "Reply with EXACTLY these seven fields, each on its own line, nothing before or after:\n"
+    "SUMMARY: <1-2 sentences: what the file/target IS (its type/size) and the most notable observations>\n"
     "VERDICT: <SOLVED | NEEDS_MORE_WORK | INCONCLUSIVE>\n"
     "FLAG: <the flag verbatim, or NONE>\n"
     "CONFIDENCE: <HIGH | MEDIUM | LOW>\n"
     "WHY: <one sentence tying the verdict to evidence in the report>\n"
-    "NEXT_STEPS: <if not solved, 1-3 concrete next actions; else NONE>\n"
+    "NEXT_STEPS: <if not solved, 2-5 concrete next actions ordered by value; else NONE>\n"
     "COMMANDS: <exact shell command(s) for the next step, or NONE>"
 )
 
@@ -477,29 +485,91 @@ def scan_artifacts(work, file_cap=ARTIFACT_FILE_CAP, total_cap=ARTIFACT_TOTAL_CA
 
 
 # ---------------------------------------------------------------- eval build
-def heuristic_eval(report, rflags, reason):
-    """F16: deterministic offline verdict from the report alone."""
+def parse_report_meta(report):
+    """Pull file type/size out of the ctf-file IDENTIFY block (deterministic)."""
+    meta = {"type": "", "size": ""}
+    m = re.search(r"(?im)^\s*type\s*:\s*(.+)$", report)
+    if m:
+        meta["type"] = m.group(1).strip()
+    m = re.search(r"(?im)^\s*size\s*:\s*(.+)$", report)
+    if m:
+        meta["size"] = m.group(1).strip()
+    return meta
+
+
+def type_next_steps(type_str, base):
+    """Type-aware offline next steps + commands, keyed off the `file` type string."""
+    t = (type_str or "").lower()
+    f = base
+    if re.search(r"\belf\b|executable|pe32|mach-o|\bpe\b|shared object", t):
+        return (["Run it in a sandbox/VM to observe behavior",
+                 "Trace library/system calls: ltrace / strace",
+                 "Decompile with Ghidra or radare2 (r2 -A) and read main",
+                 "Check protections and strings: checksec, strings -n 6"],
+                [f"./{f}", f"ltrace ./{f}", f"strings -n 6 {f} | less", f"r2 -A {f}"])
+    if re.search(r"zip|rar|7-?zip|tar|gzip|archive|cabinet", t):
+        return (["Crack/extract the archive (auto-escalate wordlists)",
+                 "Recurse into any nested archives it yields"],
+                [f"ctf-file {f} -d hard -c"])
+    if re.search(r"png|jpeg|jpg|gif|bitmap|image", t):
+        return (["Run stego tools (zsteg/steghide/stegseek) and check metadata",
+                 "Look for appended data past the image EOF / LSB stego"],
+                [f"zsteg -a {f}", f"exiftool {f}", f"steghide info {f}"])
+    if re.search(r"wave|audio|mpeg audio|flac", t):
+        return (["Render a spectrogram — flags are often drawn in the spectrum",
+                 "Check for DTMF/morse or SSTV in the audio"],
+                [f"sox {f} -n spectrogram -o spectrogram.png"])
+    if re.search(r"pcap|capture|tcpdump", t):
+        return (["Follow the TCP/HTTP streams and export transferred objects",
+                 "Hunt cleartext creds and interesting protocols"],
+                [f"tshark -r {f} -q -z io,phs",
+                 f"tshark -r {f} --export-objects http,./http-objects"])
+    if re.search(r"pdf", t):
+        return (["Extract embedded objects/attachments and scan for macros",
+                 "Dump images and text layers"],
+                [f"pdfdetach -saveall {f}", f"pdf-parser {f}"])
+    if re.search(r"composite document|ole|microsoft|openxml|word|excel", t):
+        return (["Dump and analyze VBA macros", "Extract embedded OLE objects"],
+                [f"olevba {f}"])
+    if re.search(r"filesystem|partition|disk|boot sector", t):
+        return (["Walk the filesystem with Sleuth Kit and carve files",
+                 "List then extract inodes of interest"],
+                [f"mmls {f}", f"fls -r {f}"])
+    if re.search(r"ascii|text|utf-8|unicode|json|xml|html|source", t):
+        return (["Inspect the text and decode any encoded blobs (base64/hex/rot13)",
+                 "Search directly for the flag prefix"],
+                [f"grep -aoiE 'flag|ctf|key' {f}"])
+    return (["Inspect the triage report manually; nothing auto-decoded."], [])
+
+
+def heuristic_eval(report, rflags, reason, base="the target"):
+    """F16: deterministic offline verdict from the report alone (type-aware)."""
+    meta = parse_report_meta(report)
+    summary = ""
+    if meta["type"]:
+        summary = f"{base}: {meta['type']}" + (f", {meta['size']}" if meta["size"] else "")
     if rflags:
         return {
             "verdict": "SOLVED", "flag": rflags[0], "flag_verified": True,
             "confidence": "HIGH",
+            "summary": summary or f"{base}: flag recovered from triage",
             "why": "flag present verbatim in the triage report",
             "next_steps": [], "commands": [],
         }
-    ns, cmds = [], []
+    ns, cmds = type_next_steps(meta["type"], base)
     if re.search(r"run with -c|re-run.*-c|PASSWORD GUESSING", report):
-        ns.append("Re-run cracking tiers: ctf-file <file> -d hard -c")
-        cmds.append("ctf-file <file> -d hard -c")
-    if not ns:
-        ns.append("Inspect the triage report manually; nothing auto-decoded.")
+        ns = ["Re-run cracking tiers: ctf-file <file> -d hard -c"] + ns
+        cmds = [f"ctf-file {base} -d hard -c"] + cmds
     return {
         "verdict": "NEEDS_MORE_WORK", "flag": None, "flag_verified": False,
-        "confidence": "LOW", "why": f"no flag auto-found ({reason})",
+        "confidence": "LOW",
+        "summary": summary or f"no type auto-detected for {base}",
+        "why": f"no flag auto-found ({reason})",
         "next_steps": ns, "commands": cmds,
     }
 
 
-def eval_or_fallback(answer, report, rflags, artifact_text, used_model, reason_label):
+def eval_or_fallback(answer, report, rflags, artifact_text, used_model, reason_label, base="the target"):
     """Parse the model reply into a verdict; if NOTHING parseable came back
     (e.g. the model looped or its answer was truncated by max_tokens), degrade to
     the deterministic heuristic instead of emitting a bare empty INCONCLUSIVE.
@@ -508,12 +578,13 @@ def eval_or_fallback(answer, report, rflags, artifact_text, used_model, reason_l
     if not any(v.strip() for v in fields.values()):
         eprint(f"[ctf-eval] {used_model} returned no parseable verdict "
                f"(truncated or looped) — falling back to offline heuristic")
-        return heuristic_eval(report, rflags, f"{reason_label}: unparseable reply"), \
+        return heuristic_eval(report, rflags, f"{reason_label}: unparseable reply", base), \
                f"{used_model}+heuristic"
     return build_eval(fields, report, rflags, artifact_text), used_model
 
 
 def build_eval(fields, report, rflags, artifact_text=""):
+    summary = norm_none(fields["SUMMARY"])
     verdict = norm_none(fields["VERDICT"]).upper() or "INCONCLUSIVE"
     flag = norm_none(fields["FLAG"]) or None
     conf = norm_none(fields["CONFIDENCE"]).upper() or "LOW"
@@ -548,7 +619,8 @@ def build_eval(fields, report, rflags, artifact_text=""):
 
     return {
         "verdict": verdict, "flag": flag, "flag_verified": flag_verified,
-        "confidence": conf, "why": why, "next_steps": steps, "commands": cmds,
+        "confidence": conf, "summary": summary, "why": why,
+        "next_steps": steps, "commands": cmds,
     }
 
 
@@ -559,6 +631,8 @@ def print_summary(ev, model):
     v = ev["verdict"]
     vcol = "32" if v == "SOLVED" else ("33" if v == "NEEDS_MORE_WORK" else "36")
     print(c("36;1", "=== EVAL ===") if C else "=== EVAL ===")
+    if ev.get("summary"):
+        print(f"  summary    : {ev['summary']}")
     # Cost signal: amber for the paid remote gateway, green for a free local/offline
     # evaluator. A "remote error → local/heuristic" fall still costs (the remote call
     # was made), so a used_model that mentions the remote id counts as paid.
@@ -591,6 +665,7 @@ def write_json(path, ev, model, base, report_file, trace_file, rflags,
         "file": base, "model": model,
         "verdict": ev["verdict"], "flag": ev["flag"],
         "flag_verified": ev["flag_verified"], "confidence": ev["confidence"],
+        "summary": ev.get("summary", ""),
         "why": ev["why"], "next_steps": ev["next_steps"], "commands": ev["commands"],
         "report_flags": rflags, "artifact_flags": artifact_flags or [],
         "artifacts": manifest or [],
@@ -602,7 +677,7 @@ def write_json(path, ev, model, base, report_file, trace_file, rflags,
 
 
 # ---------------------------------------------------------------- eval dispatch
-def run_model_eval(chat_fn, label, report, rflags, artifact_text, trace_path):
+def run_model_eval(chat_fn, label, report, rflags, artifact_text, trace_path, base="the target"):
     """Call chat_fn() -> (content, reasoning), write the eval trace, and parse the
     reply into a verdict. Raises on transport failure so the caller can fall down
     the degrade ladder (remote → local → offline). Returns (ev, used_model, trace_file)."""
@@ -612,7 +687,7 @@ def run_model_eval(chat_fn, label, report, rflags, artifact_text, trace_path):
         if reasoning.strip():
             f.write("=== REASONING (model thinking) ===\n" + reasoning.strip() + "\n\n")
         f.write("=== ANSWER (parsed for verdict) ===\n" + content.strip() + "\n")
-    ev, used_model = eval_or_fallback(answer, report, rflags, artifact_text, label, label)
+    ev, used_model = eval_or_fallback(answer, report, rflags, artifact_text, label, label, base)
     return ev, used_model, os.path.basename(trace_path)
 
 
@@ -785,7 +860,7 @@ def main():
     def _remote():
         eprint(f"[ctf-eval] asking remote brain {REMOTE_MODEL} ({REMOTE_BASE}) ...")
         return run_model_eval(lambda: remote_chat(SYSTEM, prompt, echo=echo),
-                              REMOTE_MODEL, report, rflags, artifact_text, trace_path)
+                              REMOTE_MODEL, report, rflags, artifact_text, trace_path, base)
 
     def _local():
         # D5 (resolved 2026-07-22): no dolphin refusal-fallback on the EVAL path.
@@ -794,11 +869,11 @@ def main():
         # here just flows through as the model's answer.
         eprint(f"[ctf-eval] asking {model} (keep_alive={KEEPALIVE}) ...")
         return run_model_eval(lambda: stream_chat(model, SYSTEM, prompt, echo),
-                              model, report, rflags, artifact_text, trace_path)
+                              model, report, rflags, artifact_text, trace_path, base)
 
     if offline:
         eprint("[ctf-eval] offline eval (requested)")
-        ev, used_model = heuristic_eval(report, rflags, "requested"), "offline-heuristic"
+        ev, used_model = heuristic_eval(report, rflags, "requested", base), "offline-heuristic"
     elif use_remote:
         try:
             ev, used_model, trace_file = _remote()
@@ -811,22 +886,22 @@ def main():
                 except Exception as e2:
                     eprint(f"[ctf-eval] local model failed ({e2}) — offline heuristic")
                     ev, used_model = heuristic_eval(report, rflags,
-                                                    f"remote+local failed"), "offline-heuristic"
+                                                    f"remote+local failed", base), "offline-heuristic"
             else:
                 eprint(f"[ctf-eval] {MAC_IP}:11434 unreachable — offline heuristic")
                 ev, used_model = heuristic_eval(report, rflags,
-                                                f"remote error: {e}"), "offline-heuristic"
+                                                f"remote error: {e}", base), "offline-heuristic"
     elif not server_up():
         eprint(f"[ctf-eval] offline eval ({MAC_IP}:11434 unreachable)")
         ev, used_model = heuristic_eval(report, rflags,
-                                        f"{MAC_IP}:11434 unreachable"), "offline-heuristic"
+                                        f"{MAC_IP}:11434 unreachable", base), "offline-heuristic"
     else:
         try:
             ev, used_model, trace_file = _local()
         except Exception as e:
             eprint(f"[ctf-eval] model call failed ({e}) — falling back to offline heuristic")
             ev, used_model = heuristic_eval(report, rflags,
-                                            f"model error: {e}"), "offline-heuristic"
+                                            f"model error: {e}", base), "offline-heuristic"
 
     print_summary(ev, used_model)
     write_json(json_path, ev, used_model, base, os.path.basename(report_path),

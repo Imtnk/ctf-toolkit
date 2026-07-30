@@ -33,7 +33,7 @@ APT_CORE="file binutils xxd binwalk libimage-exiftool-perl unzip john steghide s
 # network (pcap), documents, QR, audio, disk/memory forensics
 APT_FORENSICS="tshark tcpflow poppler-utils zbar-tools sleuthkit foremost testdisk sox python3-oletools"
 # reverse engineering & pwnable (gdb+gef usually already present; ROPgadget/ropper/checksec via pip/pkg)
-APT_REVERSE="patchelf strace ltrace gdb"
+APT_REVERSE="patchelf strace ltrace gdb radare2 ghidra"
 # mobile security — static APK analysis (dynamic frida/objection via pipx below)
 APT_MOBILE="apktool jadx dex2jar adb apksigner aapt"
 # web application — discovery, fingerprint, scanners, exploitation (used by ctf-web)

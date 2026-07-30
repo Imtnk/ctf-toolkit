@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ctf-rec — record the terminal session to a `script` typescript, then drop into a
-# shell. `ctf-writeup` later reads the newest ~/.ctf-sessions/*.log (via $CTF_SESSION_LOG)
-# as the session ground truth.
+# shell (or run one command). `ctf-writeup` later reads the newest ~/.ctf-sessions/*.log
+# (via $CTF_SESSION_LOG) as the session ground truth.
 #
 # Why a typescript and not tmux/history: a `script` log survives everything an
 # interactive solve throws at it — `clear` (escape codes are just bytes in the file),
@@ -9,35 +9,77 @@
 # `nc -lvnp 4444` (their output streams into the file live). tmux scrollback is wiped
 # by `clear`, and shell history keeps commands but no output.
 #
+# The recorded shell is made SELF-SUFFICIENT so `ai` works inside it: ctf-rec sources
+# the toolkit secrets (so the remote-brain key CTF_REMOTE_API_KEY reaches `ai`/`ai agent`
+# regardless of whether `script` starts a shell that reads ~/.bashrc) and puts the
+# toolkit bin dir on PATH. The API key is only ever an env var — never written to the log.
+#
 # Usage:
-#   ctf-rec                 # start recording, spawn $SHELL; `exit` stops + prints the log path
-#   ctf-rec <name>          # label the log file (~/.ctf-sessions/<name>-<ts>.log)
-#   ctf-rec -- <cmd...>     # record a single command instead of an interactive shell
+#   ctf-rec                       # record, spawn $SHELL; `exit`/Ctrl-D stops
+#   ctf-rec -n box42              # label the log: ~/.ctf-sessions/box42-<ts>.log
+#   ctf-rec ai agent "task..."    # record a single command instead of an interactive shell
+#   ctf-rec -- <cmd...>           # '--' also terminates options
 set -euo pipefail
+
+usage(){ sed -n '16,20p' "$0" | sed 's/^#  \{0,1\}//'; }
 
 DIR="${CTF_SESSIONS_DIR:-$HOME/.ctf-sessions}"
 mkdir -p "$DIR"
 TS="$(date +%Y%m%dT%H%M%S)"
 
+# Arg parse: -n/--name NAME sets the log label; '--' terminates options; every other
+# arg is part of the COMMAND to record. A leading bare word is NO LONGER swallowed as a
+# label (that was the old bug: `ctf-rec ai "x"` ran `x`), so command forms work.
 label=""
-# optional label (a leading non-dash, non-'--' word), then an optional '--' separator.
-if [ $# -gt 0 ] && [ "$1" != "--" ] && [ "${1#-}" = "$1" ]; then
-  label="$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')-"; shift
-fi
-[ "${1:-}" = "--" ] && shift
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--name) shift; label="${1:-}" ;;
+    --name=*)  label="${1#--name=}" ;;
+    --)        shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done; break ;;
+    -h|--help) usage; exit 0 ;;
+    *)         args+=("$1") ;;
+  esac
+  shift
+done
+[ -n "$label" ] && label="$(printf '%s' "$label" | tr -c 'A-Za-z0-9._-' '_')-"
 LOG="$DIR/${label}${TS}.log"
 
+# ---- make the recorded shell self-sufficient (the fix for `ai` not working) --------
+# 1. brain key: source the toolkit secrets so CTF_REMOTE_API_KEY is exported into the
+#    recorded shell even when `script` spawns a shell that skips ~/.bashrc.
+SECRETS="${CTF_SECRETS_FILE:-$HOME/.config/ctf-toolchain/secrets.env}"
+if [ -f "$SECRETS" ]; then
+  set -a; . "$SECRETS"; set +a
+fi
+# 2. PATH: ensure this script's dir (toolkit bin) + the user bin dirs are reachable so
+#    `ai`, `ctf-eval`, `ctf-writeup` resolve inside the recorded shell.
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+case ":$PATH:" in *":$SELF_DIR:"*) ;; *) PATH="$SELF_DIR:$PATH" ;; esac
+for d in "$HOME/.local/bin" "$HOME/bin"; do
+  case ":$PATH:" in *":$d:"*) ;; *) [ -d "$d" ] && PATH="$d:$PATH" ;; esac
+done
+export PATH
 export CTF_SESSION_LOG="$LOG"
 
+# nudge if the AI brain will be off in the recorded shell
+if [ -z "${CTF_REMOTE_API_KEY:-}" ]; then
+  echo "[ctf-rec] note: no CTF_REMOTE_API_KEY — 'ai' will fall back to local/offline only."
+  echo "[ctf-rec]       add a key to $SECRETS to enable the remote brain."
+fi
+
 echo "[ctf-rec] recording -> $LOG"
-echo "[ctf-rec] run your solve; type 'exit' (or Ctrl-D) to stop. Then: ctf-writeup [<target>]"
 
 # `script` flavors differ (util-linux vs BSD). util-linux (Kali) takes: -q quiet,
 # -f flush after each write (so a concurrent ctf-writeup sees a live log), then the
-# logfile. A trailing command runs non-interactively; no command => an interactive shell.
-if [ $# -gt 0 ]; then
-  script -q -f -c "$*" "$LOG"
+# logfile. -c CMD runs one command non-interactively; no -c => an interactive shell.
+if [ ${#args[@]} -gt 0 ]; then
+  # printf %q preserves quoted args (fixes the old `script -c "$*"` flattening bug).
+  CMD="$(printf '%q ' "${args[@]}")"
+  echo "[ctf-rec] recording command: ${CMD}"
+  script -q -f -c "$CMD" "$LOG"
 else
+  echo "[ctf-rec] run your solve; type 'exit' (or Ctrl-D) to stop. Then: ctf-writeup [<target>]"
   script -q -f "$LOG"
 fi
 

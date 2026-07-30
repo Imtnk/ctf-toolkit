@@ -146,7 +146,7 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
 else C_H=''; C_G=''; C_Y=''; C_R=''; C_M=''; C_D=''; C_B=''; C_0=''; fi
 
 # progress bar + spinner: stderr, interactive-only
-PROG=0; STEP=0; TOTAL=11; [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && PROG=1
+PROG=0; STEP=0; TOTAL=12; [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && PROG=1
 # prompts: only when BOTH stdout and stdin are terminals (so ctf-eval's pipe never prompts)
 INTERACTIVE=0; [ -t 1 ] && [ -t 0 ] && INTERACTIVE=1
 
@@ -302,6 +302,58 @@ if [ "$is_apk" = 1 ]; then
     if [ -n "$ahits" ]; then note "APK secret/endpoint hits (first 20 — expect noise):"; printf '%s\n' "$ahits" | sed 's/^/    /'
     else dim "no obvious secrets/endpoints in decompiled sources"; fi
   else warn "-n given — skipping APK decompilation"; fi
+fi
+# Native executable — reverse-engineering triage (protections + disasm + auto-decompile)
+IS_NATIVE=0
+case "$TYPE" in
+  *ELF*|*"PE32"*|*"PE32+"*|*Mach-O*|*executable*)
+    case "$TYPE" in *script*|*ASCII*|*text*|*Python*|*Perl*|*shell*) ;; *) IS_NATIVE=1;; esac ;;
+esac
+if [ "$IS_NATIVE" = 1 ]; then
+  sec "REVERSE ENGINEERING (native binary)"
+  mkout
+  # fast, always-on: protections, symbols, quick disassembly of main
+  if have checksec; then logcmd "checksec --file=\"$F\""
+    checksec --file="$F" > "$OUT/checksec.txt" 2>/dev/null || checksec "$F" > "$OUT/checksec.txt" 2>/dev/null || true
+    sed -i 's/\x1b\[[0-9;]*m//g' "$OUT/checksec.txt" 2>/dev/null   # strip checksec ANSI so the report stays clean plain text
+    [ -s "$OUT/checksec.txt" ] && { note "checksec -> $OUT/checksec.txt"; sed -n '1,8p' "$OUT/checksec.txt" | sed 's/^/  /'; }
+  fi
+  if have nm; then logcmd "nm -C \"$F\""; nm -C "$F" 2>/dev/null > "$OUT/symbols.txt"; fi
+  if [ ! -s "$OUT/symbols.txt" ] && have readelf; then logcmd "readelf -sW \"$F\""; readelf -sW "$F" 2>/dev/null > "$OUT/symbols.txt"; fi
+  [ -s "$OUT/symbols.txt" ] && note "symbols -> $OUT/symbols.txt ($(wc -l < "$OUT/symbols.txt") lines)"
+  if have r2; then logcmd "r2 -qc 'aaa; s main; pdf' \"$F\""
+    spin "disassembling main (r2)" bash -c 'r2 -e scr.color=0 -qc "aaa; s main; pdf" "$1" > "$2/disasm-main.txt" 2>/dev/null' _ "$F" "$OUT"
+    [ -s "$OUT/disasm-main.txt" ] && note "disasm of main -> $OUT/disasm-main.txt"
+  fi
+  # slow, high-value: full decompilation to C pseudocode. Ghidra headless if present,
+  # else radare2's decompiler (pdg/pdc). Bounded (240s) + non-fatal. Skipped with -n.
+  if [ "$NO_EXTRACT" = 1 ]; then
+    warn "-n given — skipping decompilation (checksec/symbols/disasm still written)"
+  else
+    GH_HOME="${GHIDRA_HOME:-/usr/share/ghidra}"; HEADLESS=""
+    [ -x "$GH_HOME/support/analyzeHeadless" ] && HEADLESS="$GH_HOME/support/analyzeHeadless"
+    [ -z "$HEADLESS" ] && command -v analyzeHeadless >/dev/null 2>&1 && HEADLESS="$(command -v analyzeHeadless)"
+    DECOMP_SCRIPT="$(dirname "$(readlink -f "$0")")/../scripts/ghidra_decompile.java"
+    if [ -n "$HEADLESS" ] && [ -f "$DECOMP_SCRIPT" ]; then
+      note "decompiling with Ghidra headless (may take a few minutes; -n to skip) ..."
+      TMPPROJ="$(mktemp -d "${TMPDIR:-/tmp}/ctf-ghidra.XXXXXX")"
+      SCRIPT_DIR="$(cd "$(dirname "$DECOMP_SCRIPT")" && pwd)"; SCRIPT_NAME="$(basename "$DECOMP_SCRIPT")"
+      DEC_ABS="$(cd "$OUT" && pwd)/decompiled.txt"
+      logcmd "$HEADLESS <proj> tmp -import \"$F\" -scriptPath \"$SCRIPT_DIR\" -postScript $SCRIPT_NAME <out> -deleteProject"
+      spin "ghidra decompile" bash -c 'timeout 240 "$1" "$2" tmp -import "$3" -scriptPath "$4" -postScript "$5" "$6" -deleteProject >/dev/null 2>&1' _ "$HEADLESS" "$TMPPROJ" "$F" "$SCRIPT_DIR" "$SCRIPT_NAME" "$DEC_ABS"
+      rm -rf "$TMPPROJ" 2>/dev/null
+      if [ -s "$OUT/decompiled.txt" ]; then hit "decompiled -> $OUT/decompiled.txt ($(wc -l < "$OUT/decompiled.txt") lines)"
+        dtok="$(flagtok_in "$OUT/decompiled.txt")"; [ -n "$dtok" ] && gotflag "flag in decompilation: $dtok" "DECOMPILE: $dtok"
+      else warn "Ghidra produced no decompilation (timeout/parse) — trying radare2"; fi
+    fi
+    if [ ! -s "$OUT/decompiled.txt" ] && have r2; then
+      logcmd "r2 -qc 'aaa; s main; pdg' \"$F\"  (radare2 decompiler)"
+      spin "decompiling main (r2)" bash -c 'r2 -e scr.color=0 -qc "aaa; s main; pdg 2>/dev/null || pdc" "$1" > "$2/decompiled.txt" 2>/dev/null' _ "$F" "$OUT"
+      if [ -s "$OUT/decompiled.txt" ]; then note "decompiled main (r2) -> $OUT/decompiled.txt"
+        dtok="$(flagtok_in "$OUT/decompiled.txt")"; [ -n "$dtok" ] && gotflag "flag in decompilation: $dtok" "DECOMPILE: $dtok"
+      else dim "no decompiler available (install ghidra or radare2)"; fi
+    fi
+  fi
 fi
 # PDF: pull embedded images + attachments (TCTT hides objects/streams inside PDFs)
 case "$TYPE" in *PDF*)

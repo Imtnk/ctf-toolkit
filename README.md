@@ -86,19 +86,26 @@ echo '[ -f ~/.config/ctf-toolchain/secrets.env ] && source ~/.config/ctf-toolcha
 
 Runs a battery of forensics tools over a file (type ID, strings, metadata, embedded-file carving,
 stego, archive cracking) and prints a report. Recognizes **Android APKs** and auto-decompiles them
-(jadx + apktool, manifest via aapt, native-lib strings). Extracted payloads land in `./<file>-work/`.
+(jadx + apktool, manifest via aapt, native-lib strings). **Native executables (ELF/PE/Mach-O)** are
+auto-triaged too — it writes `checksec.txt`, `symbols.txt`, `disasm-main.txt` (radare2) and
+**`decompiled.txt`** (C pseudocode from **Ghidra headless**, radare2 `pdg`/`pdc` fallback). Extracted
+payloads and these analysis files land in `./<file>-work/`, so `ctf-eval`/`ctf-writeup` read the
+decompilation with no manual Ghidra step.
 
 ```bash
 ctf-file suspicious.png                 # default triage
 ctf-file locked.zip -d hard -c          # deeper dig + cracking tiers
+ctf-file crackme -n                     # native binary, but skip the (slow) Ghidra decompile
 ```
 
 ### `ctf-eval` — triage **+ AI verdict**
 
 Runs `ctf-file`, then feeds **both** the report and the extracted artifacts to the brain, which
-returns a structured verdict (SOLVED / NEEDS_MORE_WORK / INCONCLUSIVE + flag + next steps). A flag
-sitting only inside an extracted file still counts as ground truth. Outputs land in `./<file>-work/`
-(`triage-report.txt`, `eval-trace.txt`, `eval.json`).
+returns a structured verdict: a **SUMMARY** of what the target is (type/size/observations), the
+SOLVED / NEEDS_MORE_WORK / INCONCLUSIVE call + flag, and **type-aware next steps** (an executable →
+run it / `ltrace` / Ghidra; an image → stego sweep; a pcap → follow streams; …). A flag sitting only
+inside an extracted file still counts as ground truth. Outputs land in `./<file>-work/`
+(`triage-report.txt`, `eval-trace.txt`, `eval.json` — now with a `summary` field, schema v1.1).
 
 ```bash
 ctf-eval locked.zip                     # triage + eval with the remote brain (default)
@@ -179,12 +186,18 @@ ctf-writeup locked.zip --style report   # standard (default) | concise | report
 ctf-writeup locked.zip --no-session     # artifacts only, skip session capture
 ctf-writeup locked.zip -v               # stream the model's live output
 ctf-writeup locked.zip --offline        # no model → deterministic template stub
+ctf-writeup crackme3 "f0r_y0ur_..."      # assert a non-standard flag (2nd arg, or --flag TEXT)
+ctf-writeup crackme4 --note "pwd from ghidra compare_pwd"   # trusted account of an out-of-shell solve
 ```
 
 Assumes the challenge is solved. If **no flag** is found in the ground truth (session +
 artifacts), it never invents one — the writeup ends with a **Suggested next steps** section
 instead. A flag the model quotes that isn't in the ground truth gets a hallucination warning
-appended. Same brain ladder as `ctf-eval` (remote gateway → local Ollama → offline stub);
+appended. **Method grounding:** it only describes commands that actually appear in the session /
+`commands.log` — it won't fabricate a `strings|grep` pipeline for a value you actually pulled from a
+GUI tool (Ghidra/gdb/IDA). Pass **`--note "…"`** (or a 2nd-positional / `--flag` for a non-standard
+flag) to hand it the flag and *how you really got it*; it reconstructs the rest of the flow around
+that, without inventing steps. Same brain ladder as `ctf-eval` (remote gateway → local Ollama → offline stub);
 `ctf-writeup --check` reports which one is live. The `-work/` folder is created in your
 **current directory** (named `<basename>-work/`, like `ctf-eval`), so run it from the
 challenge's directory.
@@ -201,11 +214,15 @@ challenge's directory.
 Start a CTF under `ctf-rec` and the whole session is captured to a `script` typescript that
 `ctf-writeup` reads automatically. This is the reliable capture path — a typescript keeps
 everything (`clear` can't wipe it, `exit` finalizes it, blocking-command output streams in live).
+The recorded shell is made **self-sufficient**: `ctf-rec` sources your `secrets.env` and fixes
+`PATH`, so **`ai` / `ai agent` reach the remote brain inside the recording** (the key stays an env
+var — it is never written to the typescript).
 
 ```bash
 ctf-rec                                 # record → spawn $SHELL; `exit` (or Ctrl-D) stops
-ctf-rec box42                           # label the log: ~/.ctf-sessions/box42-<ts>.log
-ctf-rec -- 'strings chal | grep flag'   # record a single command instead of a shell
+ctf-rec -n box42                        # label the log: ~/.ctf-sessions/box42-<ts>.log
+ctf-rec ai agent "solve ./chal"         # record any command (not just an interactive shell)
+ctf-rec -- strings chal                 # '--' also terminates ctf-rec's own options
 ```
 
 ### `ai` — one-shot Q&A + ReAct agent
@@ -300,6 +317,7 @@ Each turn: **model → JSON `{thought, tool, args}` → approval → execute →
 | `file_info(path)` | auto | `file` command + size + SHA-256 |
 | `hexdump(path, n)` | auto | First n bytes, hex+ASCII |
 | `strings(path, min_len)` | auto | Printable strings |
+| `decompile(path, func)` | ask (long-running) | C pseudocode via Ghidra headless (radare2 fallback); own minutes-long timeout |
 | `http_request(method, url, …)` | ask | Web requests via urllib |
 | `revshell(shell, lhost, lport)` | auto | Generate a reverse-shell one-liner (inert; catch with `ctf-rev listen`) |
 | `finish(answer)` | — | End loop; triggers verification first |

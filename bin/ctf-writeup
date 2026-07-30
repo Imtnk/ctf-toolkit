@@ -10,6 +10,8 @@ section instead of a flag — a flag is NEVER invented.
 Usage:
   ctf-writeup                         # session-wide: all *-work/ under cwd -> session-work/writeup.md
   ctf-writeup <file>                  # one challenge: reads <file>-work/, writes writeup.md there
+  ctf-writeup <file> "FLAG_TEXT"       # assert the flag (non-standard formats OK) as 2nd arg
+  ctf-writeup <file> --note "..."      # trusted account of an out-of-shell solve (e.g. GUI Ghidra)
   ctf-writeup http://10.10.10.10      # web target -> <host[_port]>-work/
   ctf-writeup <file> --log run.log    # use an explicit session log (or pipe on stdin)
   ctf-writeup <file> --no-session     # writeup from artifacts only (skip session capture)
@@ -115,7 +117,15 @@ _STYLE_TAIL = (
     "supported by them. If a flag is present, quote it VERBATIM in a fenced code block. "
     "If NO flag is present, do not guess one: finish with a '## Suggested next steps' "
     "section listing 1-3 concrete next actions with exact commands. Do not fabricate "
-    "reasoning you did not actually see evidence for."
+    "reasoning you did not actually see evidence for.\n\n"
+    "METHOD GROUNDING: only describe commands/methods that actually appear in the terminal "
+    "session or a commands.log. Do NOT invent a shell command (e.g. a strings|grep pipeline) "
+    "that 'would have' produced a value you actually got another way. If a value (a password, "
+    "a string, an address) was clearly obtained via a GUI or external tool that was launched "
+    "but whose output is not captured (for example ghidra, gdb, IDA, a decompiler, a browser), "
+    "attribute it to that tool's static/dynamic analysis and describe it from the artifacts "
+    "(e.g. a decompiled.txt / disasm) rather than a fabricated command you did not run. When a "
+    "user solve-note is provided, treat it as trusted ground truth for those out-of-shell steps."
 )
 SYSTEM = {
     "standard": (
@@ -462,7 +472,8 @@ def find_flags(*texts):
 
 
 # ---------------------------------------------------------------- prompt / stub
-def build_prompt(label, session_text, session_src, manifest, artifact_text, flags):
+def build_prompt(label, session_text, session_src, manifest, artifact_text, flags,
+                 manual_flag=None, note=None):
     art_list = "\n".join(f"  {m['path']}  ({m['size']} B, {m['kind']})"
                          for m in manifest) or "  (none)"
     p = [f"Write a CTF writeup for: {label}\n"]
@@ -472,6 +483,18 @@ def build_prompt(label, session_text, session_src, manifest, artifact_text, flag
     else:
         p.append("No flag was found in the session or artifacts — do NOT invent one; "
                  "end with concrete next steps.\n")
+    if manual_flag:
+        p.append("Confirmed flag (user-supplied ground truth — may be a non-standard format; "
+                 "quote it VERBATIM as the flag, do not alter or 'correct' it): "
+                 + manual_flag + "\n")
+    if note:
+        p.append("The user's account of HOW the challenge was solved (TRUSTED ground truth "
+                 "for steps NOT captured in the recorded session, e.g. GUI Ghidra work):\n"
+                 + note + "\n"
+                 "Use it to describe the actual method — you MAY narrate those out-of-shell "
+                 "steps because the user attested them — and stitch them together with the "
+                 "recon and validation that ARE in the session/artifacts. Do not invent "
+                 "anything beyond this account and the captured evidence.\n")
     p.append(f"--- BEGIN TERMINAL SESSION (source: {session_src}) ---\n"
              f"{session_text or '(no session captured)'}\n--- END TERMINAL SESSION ---\n")
     p.append(f"Artifacts on disk:\n{art_list}")
@@ -564,6 +587,8 @@ def parse_args(argv):
     offline = local = verbose = no_session = False
     explicit_log = None
     target = None
+    manual_flag = None
+    note = None
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -586,6 +611,20 @@ def parse_args(argv):
             explicit_log = argv[i]
         elif a.startswith("--log="):
             explicit_log = a.split("=", 1)[1]
+        elif a == "--flag":
+            i += 1
+            if i >= len(argv):
+                eprint("[ctf-writeup] --flag needs a value"); sys.exit(1)
+            manual_flag = argv[i]
+        elif a.startswith("--flag="):
+            manual_flag = a.split("=", 1)[1]
+        elif a == "--note":
+            i += 1
+            if i >= len(argv):
+                eprint("[ctf-writeup] --note needs a value"); sys.exit(1)
+            note = argv[i]
+        elif a.startswith("--note="):
+            note = a.split("=", 1)[1]
         elif a == "--style":
             i += 1
             if i >= len(argv) or argv[i] not in SYSTEM:
@@ -606,10 +645,13 @@ def parse_args(argv):
             eprint(f"[ctf-writeup] unknown option {a}"); sys.exit(1)
         elif target is None:
             target = a
+        elif manual_flag is None:
+            manual_flag = a       # 2nd positional = the flag (matches `ctf-writeup chal FLAG`)
         else:
             eprint(f"[ctf-writeup] unexpected arg {a}"); sys.exit(1)
         i += 1
-    return target, model, style, offline, local, verbose, no_session, explicit_log
+    return (target, model, style, offline, local, verbose, no_session, explicit_log,
+            manual_flag, note)
 
 
 def resolve_scope(target):
@@ -635,7 +677,7 @@ def main():
     if "--check" in sys.argv[1:]:
         run_check()
     (target, model, style, offline, local, verbose,
-     no_session, explicit_log) = parse_args(sys.argv[1:])
+     no_session, explicit_log, manual_flag, note) = parse_args(sys.argv[1:])
 
     label, out_dir, work_dirs, multi = resolve_scope(target)
 
@@ -655,12 +697,30 @@ def main():
     # Gather artifacts from the work dir(s).
     manifest, artifact_text, art_flags = gather_artifacts(work_dirs, multi, art_file_cap, art_total_cap)
     flags = find_flags(session_text) + [f for f in art_flags if f not in find_flags(session_text)]
-    corpus = (session_text or "") + "\n" + (artifact_text or "")
+    # user-asserted ground truth: a manual flag and/or a solve-note (may hold a non-standard
+    # flag FLAG_RE can't match). Prepend to flags; append to corpus so it's exempt from the
+    # hallucination guard (flag_sanity_note).
+    asserted = []
+    if manual_flag:
+        asserted.append(manual_flag)
+    if note:
+        import re as _re
+        for m in find_flags(note):
+            asserted.append(m)
+        m = _re.search(r"flag\s+is\s+([^\s,;]+)", note, _re.I)
+        if m:
+            asserted.append(m.group(1))
+    for fl in reversed(asserted):
+        if fl not in flags:
+            flags.insert(0, fl)
+    corpus = ((session_text or "") + "\n" + (artifact_text or "")
+              + "\n" + (manual_flag or "") + "\n" + (note or ""))
     n_art = len([m for m in manifest if m["kind"] != "unreadable"])
     eprint(f"[ctf-writeup] {n_art} artifact file(s)"
            + (f", {len(flags)} flag(s) found" if flags else ", no flag found"))
 
-    prompt = build_prompt(label, session_text, session_src, manifest, artifact_text, flags)
+    prompt = build_prompt(label, session_text, session_src, manifest, artifact_text, flags,
+                          manual_flag=manual_flag, note=note)
     echo = verbose
     reasoning = content = None
     used = ""

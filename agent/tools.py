@@ -7,7 +7,7 @@ Execution model
 ---------------
 - run_shell / python_exec  : arbitrary execution — go through the approval gate in loop.py
 - write_file               : always shows diff + prompts, even under --approve auto
-- read_file / list_dir / file_info / hexdump / strings : read-only, auto-approved
+- read_file / list_dir / file_info / hexdump / strings / decompile : read-only, auto-approved
 - http_request             : network I/O, goes through the gate
 - finish                   : terminal action, no gate
 """
@@ -328,6 +328,61 @@ def revshell(shell: str = "bash", lhost: str = "", lport: int = 4444):
 )
 def finish(answer: str):
     return answer, 0.0
+
+
+@_tool(
+    "decompile",
+    "Decompile a native binary (ELF/PE/Mach-O) to C pseudocode via Ghidra headless "
+    "(radare2 fallback). Own long timeout (minutes), unlike the 30s run_shell cap.",
+    '{"thought":"<reason>","tool":"decompile","args":{"path":"./chal","func":"main"}}',
+)
+def decompile(path: str, func: str | None = None, timeout: int = 300):
+    t0 = time.monotonic()
+    import shutil, tempfile
+    ghidra_home = os.environ.get("GHIDRA_HOME", "/usr/share/ghidra")
+    headless = os.path.join(ghidra_home, "support", "analyzeHeadless")
+    if not os.path.isfile(headless):
+        headless = shutil.which("analyzeHeadless")
+    script = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "scripts", "ghidra_decompile.java")
+    if headless and os.path.isfile(script):
+        proj = tempfile.mkdtemp(prefix="ctf-ghidra.")
+        outf = os.path.join(proj, "decompiled.txt")
+        try:
+            subprocess.run(
+                [headless, proj, "tmp", "-import", path,
+                 "-scriptPath", os.path.dirname(script),
+                 "-postScript", os.path.basename(script), outf,
+                 "-deleteProject"],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            if os.path.isfile(outf) and os.path.getsize(outf) > 0:
+                text = open(outf, encoding="utf-8", errors="replace").read()
+                if func:
+                    marker = f"==== {func} "
+                    idx = text.find(marker)
+                    if idx != -1:
+                        nxt = text.find("\n// ====", idx + 1)
+                        text = text[idx:] if nxt == -1 else text[idx:nxt]
+                return text[:20000], time.monotonic() - t0
+        except subprocess.TimeoutExpired:
+            pass
+        finally:
+            shutil.rmtree(proj, ignore_errors=True)
+    r2 = shutil.which("r2") or shutil.which("radare2")
+    if r2:
+        seek = func or "main"
+        try:
+            proc = subprocess.run(
+                [r2, "-e", "scr.color=0", "-qc", f"aaa; s {seek}; pdg || pdc", path],
+                capture_output=True, text=True, timeout=min(timeout, 180),
+            )
+            if proc.stdout.strip():
+                return proc.stdout.strip()[:20000], time.monotonic() - t0
+        except subprocess.TimeoutExpired:
+            return "[decompile: radare2 timed out]", time.monotonic() - t0
+    return "[decompile: no Ghidra headless or radare2 available]", time.monotonic() - t0
 
 
 # ── Registry helpers ───────────────────────────────────────────────────────────
