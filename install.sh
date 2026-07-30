@@ -6,6 +6,17 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 [ -f "$HERE/bin/ctf-file" ] || { echo "error: bin/ctf-file not found next to install.sh"; exit 1; }
 
+# --minimal: link the commands + wire the API key only; skip the (heavy, Kali-first)
+# apt/gem/pipx/pip provisioning. Ideal for a remote-brain-only box.
+MINIMAL=0
+for a in "$@"; do
+  case "$a" in
+    --minimal) MINIMAL=1 ;;
+    -h|--help) echo "usage: ./install.sh [--minimal]   (--minimal: skip system-tool provisioning)"; exit 0 ;;
+    *) echo "unknown arg: $a  (see ./install.sh --help)"; exit 1 ;;
+  esac
+done
+
 # ---- pick an install dir on PATH -----------------------------------------
 if printf '%s' ":$PATH:" | grep -q ":$HOME/.local/bin:"; then
   BIN="$HOME/.local/bin"
@@ -15,6 +26,7 @@ else
   BIN="$HOME/.local/bin"          # default; we'll add it to PATH below
 fi
 
+if [ "$MINIMAL" -eq 0 ]; then
 echo "==> Installing apt packages (needs sudo) ..."
 # core triage + stego + carving + archive cracking (+ jq for JSON/web work)
 APT_CORE="file binutils xxd binwalk libimage-exiftool-perl unzip john steghide stegseek pngcheck outguess ruby wordlists jq"
@@ -103,6 +115,14 @@ else
   echo "   pip not present — install $PIP_WEB into your ctf Python env"
 fi
 
+echo "==> Installing Python libs from requirements.txt (pwntools, pycryptodome, z3 — agent python_exec) ..."
+# The ReAct agent's python_exec tool draws on these; core commands (ctf-*, ai) don't need them.
+if [ -f "$HERE/requirements.txt" ] && command -v pip3 >/dev/null 2>&1; then
+  pip3 install --user -r "$HERE/requirements.txt" 2>/dev/null \
+    || pip3 install --break-system-packages -r "$HERE/requirements.txt" 2>/dev/null \
+    || echo "   (requirements.txt install failed — run 'pip install -r requirements.txt' in your ctf venv)"
+fi
+
 echo "==> Installing frida-tools + objection (mobile dynamic instrumentation, pipx) ..."
 # Optional: only needed for runtime hooking (device/emulator). Static APK analysis
 # (jadx/apktool/aapt above) covers most Jeopardy mobile challenges without these.
@@ -111,6 +131,10 @@ if command -v pipx >/dev/null 2>&1; then
   pipx install objection   || echo "   (objection install failed)"
 else
   echo "   pipx not present — 'pipx install frida-tools objection' for dynamic mobile"
+fi
+
+else
+  echo "==> --minimal: skipped apt/gem/pipx/pip provisioning (linking commands + wiring the key only)"
 fi
 
 # ---- install the commands (symlinks into this repo, so `git pull` updates them) ----
@@ -136,6 +160,38 @@ if ! printf '%s' ":$PATH:" | grep -q ":$BIN:"; then
   fi
 fi
 
+# ---- remote AI brain: wire the API key so the AI features actually turn on ----
+# The default brain is the remote gateway; without a key, ctf-eval/ctf-writeup/ai
+# silently run offline (no AI). Make the config exist and load automatically, then
+# tell the user exactly how to enable the AI.
+SECRETS_DIR="$HOME/.config/ctf-toolchain"
+SECRETS="$SECRETS_DIR/secrets.env"
+mkdir -p "$SECRETS_DIR" && chmod 700 "$SECRETS_DIR" 2>/dev/null || true
+[ -f "$SECRETS" ] || { touch "$SECRETS" && chmod 600 "$SECRETS"; }
+# make every login shell load the key (idempotent — keyed on the file path)
+SRC_ADDED=0
+for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+  [ -e "$rc" ] || continue
+  grep -qsF "$SECRETS" "$rc" 2>/dev/null || \
+    printf '\n# added by ctf-toolkit install.sh — load the CTF API key\n[ -f %s ] && . %s\n' "$SECRETS" "$SECRETS" >> "$rc"
+  SRC_ADDED=1
+done
+# no shell rc existed yet (fresh box) — create ~/.bashrc so the key still loads
+if [ "$SRC_ADDED" -eq 0 ]; then
+  printf '# added by ctf-toolkit install.sh — load the CTF API key\n[ -f %s ] && . %s\n' "$SECRETS" "$SECRETS" >> "$HOME/.bashrc"
+fi
+. "$SECRETS" 2>/dev/null || true
 echo
-echo "Done. Try:  ctf-file -h"
+if [ -n "${CTF_REMOTE_API_KEY:-}" ]; then
+  echo "==> Remote AI brain: key found in $SECRETS  (ctf-eval / ctf-writeup / ai will use it)"
+else
+  echo "==> Remote AI brain: NO API key yet — AI features run in offline (no-AI) mode."
+  echo "    Enable the AI (paste your real key — it stays on this machine):"
+  echo "      printf 'export CTF_REMOTE_API_KEY=%q\\n' 'sk-YOURKEY' >> $SECRETS"
+  echo "    Your shell now loads $SECRETS automatically; then run:  source ~/.bashrc"
+  echo "    Verify the brain any time with:  ctf-eval --check"
+fi
+
+echo
+echo "Done. Try:  ctf-file -h    (check the AI brain:  ctf-eval --check)"
 echo "(if 'command not found', run:  source ~/.bashrc )"

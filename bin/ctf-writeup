@@ -18,6 +18,7 @@ Usage:
   ctf-writeup <file> --fast           # local qwen2.5-coder (faster) — implies --local
   ctf-writeup <file> --offline        # no model — emit a template stub writeup
   ctf-writeup <file> -v               # stream the model's live output to stderr
+  ctf-writeup --check                 # report the active brain (remote/local/offline) and exit
   ctf-writeup -h
 
 Session capture (auto-detect ladder; robust choice first):
@@ -529,6 +530,34 @@ def write_outputs(out_dir, session_text, writeup_md, reasoning, content):
     return writeup_path
 
 
+# ---------------------------------------------------------------- brain check
+def run_check():
+    """`--check`: report which brain is active on this box (remote / local / offline)
+    and validate the key with one tiny gateway call. No challenge needed."""
+    print("=== ctf-writeup brain check ===")
+    print(f"  remote enabled : {REMOTE_ENABLED}  (CTF_BRAIN={'local' if not REMOTE_ENABLED else 'remote'})")
+    print(f"  remote key     : {'set' if REMOTE_KEY else 'MISSING'}")
+    print(f"  remote model   : {REMOTE_MODEL}")
+    print(f"  remote base    : {REMOTE_BASE}")
+    active = None
+    if REMOTE_KEY and REMOTE_ENABLED:
+        try:
+            content, _ = remote_chat("You are a health check.", "Reply with the single word OK.")
+            print(f"  remote ping    : OK — replied {content.strip()[:30]!r}")
+            active = "remote"
+        except Exception as e:
+            print(f"  remote ping    : FAILED ({e})")
+    elif not REMOTE_KEY:
+        print("  remote ping    : skipped — no CTF_REMOTE_API_KEY "
+              "(add one to ~/.config/ctf-toolchain/secrets.env)")
+    up = server_up()
+    print(f"  local ollama   : {'reachable' if up else 'unreachable'} at {MAC_IP}:11434")
+    if active is None:
+        active = "local" if up else "offline (stub only — no AI)"
+    print(f"  => active brain: {active}")
+    sys.exit(0)
+
+
 # ---------------------------------------------------------------- main
 def parse_args(argv):
     model, style = DEEPSEEK, "standard"
@@ -603,12 +632,18 @@ def resolve_scope(target):
 
 
 def main():
+    if "--check" in sys.argv[1:]:
+        run_check()
     (target, model, style, offline, local, verbose,
      no_session, explicit_log) = parse_args(sys.argv[1:])
 
     label, out_dir, work_dirs, multi = resolve_scope(target)
 
     use_remote = REMOTE_ENABLED and bool(REMOTE_KEY) and not local and not offline
+    if not offline and not local and not REMOTE_KEY:
+        eprint("[ctf-writeup] no CTF_REMOTE_API_KEY set — the AI brain is off; using "
+               "local/offline. Add a key to ~/.config/ctf-toolchain/secrets.env "
+               "(and `source ~/.bashrc`) to enable the AI writeup.")
     session_cap = REMOTE_SESSION_CAP if use_remote else LOCAL_SESSION_CAP
     art_file_cap  = REMOTE_ART_FILE_CAP  if use_remote else LOCAL_ART_FILE_CAP
     art_total_cap = REMOTE_ART_TOTAL_CAP if use_remote else LOCAL_ART_TOTAL_CAP

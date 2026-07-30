@@ -19,6 +19,7 @@ Usage:
   ctf-eval <file> --offline           # skip all models, deterministic heuristic eval
   ctf-eval <file> --fresh             # re-run triage even if a <base>-work/ report exists
   ctf-eval <file> -v                  # verbose: stream the model's live thinking/output to stderr
+  ctf-eval --check                    # report the active brain (remote/local/offline) and exit
 
 If a <base>-work/triage-report.txt already exists it is reused after a [Y/n] prompt (rather
 than re-running the slow triage); --fresh forces a re-run, non-interactive callers reuse it.
@@ -659,10 +660,39 @@ def parse_args(argv):
     return target, model, offline, local, verbose, fresh, passthrough
 
 
+def run_check():
+    """`--check`: report which brain is active (remote / local / offline) and validate
+    the key with one tiny gateway call. No target needed."""
+    print("=== ctf-eval brain check ===")
+    print(f"  remote enabled : {REMOTE_ENABLED}")
+    print(f"  remote key     : {'set' if REMOTE_KEY else 'MISSING'}")
+    print(f"  remote model   : {REMOTE_MODEL}")
+    print(f"  remote base    : {REMOTE_BASE}")
+    active = None
+    if REMOTE_KEY and REMOTE_ENABLED:
+        try:
+            content, _ = remote_chat("You are a health check.", "Reply with the single word OK.")
+            print(f"  remote ping    : OK — replied {content.strip()[:30]!r}")
+            active = "remote"
+        except Exception as e:
+            print(f"  remote ping    : FAILED ({e})")
+    elif not REMOTE_KEY:
+        print("  remote ping    : skipped — no CTF_REMOTE_API_KEY "
+              "(add one to ~/.config/ctf-toolchain/secrets.env)")
+    up = server_up()
+    print(f"  local ollama   : {'reachable' if up else 'unreachable'} at {MAC_IP}:11434")
+    if active is None:
+        active = "local" if up else "offline (heuristic only — no AI)"
+    print(f"  => active brain: {active}")
+    sys.exit(0)
+
+
 def main():
+    if "--check" in sys.argv[1:]:
+        run_check()
     target, model, offline, local, verbose, fresh, passthrough = parse_args(sys.argv[1:])
     if not target:
-        eprint("usage: ctf-eval <file|url> [--fast|--model M|--offline] [-- triage opts]"); sys.exit(1)
+        eprint("usage: ctf-eval <file|url> [--fast|--model M|--offline|--check] [-- triage opts]"); sys.exit(1)
 
     # Target is either a local file (→ ctf-file) or a web URL (→ ctf-web). Both write the
     # same <base>-work/ contract (triage-report.txt + artifacts), so the eval path below
@@ -690,6 +720,10 @@ def main():
     # Brain selection (known before triage): remote gateway is the default evaluator
     # when a key is present and the user didn't pick a local model or --offline.
     use_remote = REMOTE_ENABLED and bool(REMOTE_KEY) and not local and not offline
+    if not offline and not local and not REMOTE_KEY:
+        eprint("[ctf-eval] no CTF_REMOTE_API_KEY set — the AI brain is off; using "
+               "local/offline. Add a key to ~/.config/ctf-toolchain/secrets.env "
+               "(and `source ~/.bashrc`) to enable AI evaluation.")
     report_cap = REMOTE_REPORT_CAP if use_remote else REPORT_CAP
     art_file_cap  = REMOTE_ARTIFACT_FILE_CAP  if use_remote else ARTIFACT_FILE_CAP
     art_total_cap = REMOTE_ARTIFACT_TOTAL_CAP if use_remote else ARTIFACT_TOTAL_CAP

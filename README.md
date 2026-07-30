@@ -36,7 +36,13 @@ your Kali (WSL2)                       brain (reasoning only)
 git clone https://github.com/Imtnk/ctf-toolkit.git ~/ctf-toolkit
 cd ~/ctf-toolkit
 ./install.sh                 # symlinks ctf-file, ctf-eval, ctf-web, ctf-rev, ctf-writeup, ctf-rec + `ai` onto PATH
+./install.sh --minimal       # remote-brain-only box: link commands + wire the key, skip the system-tool wall
+ctf-eval --check             # confirm which brain is live (remote / local / offline)
 ```
+
+`install.sh` also creates `~/.config/ctf-toolchain/secrets.env`, makes your shell load it
+automatically, and — if no key is set yet — prints the one line to paste your API key. So on a
+fresh box the only manual step to turn on the AI is pasting the key (see **Environment**).
 
 The Python glue is **stdlib-only** (`urllib`, `json`, `subprocess`); the CTF power comes from the
 system tools it shells out to. `install.sh` provisions the full toolset across every competition
@@ -54,13 +60,21 @@ agent's `python_exec` tool draws on.
 | `CTF_BRAIN` | `remote` | Set to `local` to force the Ollama brain globally |
 | `CTF_AI_HOST` | `localhost` | Ollama host for the local brain / fallback (prefer a stable Tailscale name — see *Local Ollama is optional*) |
 
-One-time key setup (paste the real key yourself — it never passes through anyone else):
+One-time key setup. After `./install.sh` the file already exists and is auto-sourced from your
+shell rc, so the only step is pasting your real key (it never passes through anyone else):
+
+```bash
+printf 'export CTF_REMOTE_API_KEY=%q\n' 'sk-REAL' >> ~/.config/ctf-toolchain/secrets.env
+source ~/.bashrc            # (already sources secrets.env, added by install.sh)
+ctf-eval --check           # verify: should report  => active brain: remote
+```
+
+If you didn't run `install.sh` (e.g. copied a single script), create it yourself:
 
 ```bash
 mkdir -p ~/.config/ctf-toolchain && chmod 700 ~/.config/ctf-toolchain
 printf 'export CTF_REMOTE_API_KEY=%q\n' 'sk-REAL' >> ~/.config/ctf-toolchain/secrets.env
 chmod 600 ~/.config/ctf-toolchain/secrets.env
-# add to ~/.bashrc and ~/.zshrc:
 echo '[ -f ~/.config/ctf-toolchain/secrets.env ] && source ~/.config/ctf-toolchain/secrets.env' >> ~/.bashrc
 ```
 
@@ -170,7 +184,10 @@ ctf-writeup locked.zip --offline        # no model → deterministic template st
 Assumes the challenge is solved. If **no flag** is found in the ground truth (session +
 artifacts), it never invents one — the writeup ends with a **Suggested next steps** section
 instead. A flag the model quotes that isn't in the ground truth gets a hallucination warning
-appended. Same brain ladder as `ctf-eval` (remote gateway → local Ollama → offline stub).
+appended. Same brain ladder as `ctf-eval` (remote gateway → local Ollama → offline stub);
+`ctf-writeup --check` reports which one is live. The `-work/` folder is created in your
+**current directory** (named `<basename>-work/`, like `ctf-eval`), so run it from the
+challenge's directory.
 
 **Session capture** is auto-detected, robust source first:
 1. `--log FILE` or a piped stdin — used verbatim.
